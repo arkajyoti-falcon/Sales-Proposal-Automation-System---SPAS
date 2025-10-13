@@ -78,6 +78,45 @@ try:
 except Exception:
     HAS_SELENIUM = False
 
+
+# ============================================================================
+# Streamlit Cloud Selenium Setup (Firefox via SeleniumBase)
+# ============================================================================
+
+@st.cache_resource
+def setup_firefox_for_cloud():
+    """Install and configure Firefox for Streamlit Cloud"""
+    if ON_STREAMLIT_CLOUD:
+        try:
+            os.system('sbase install geckodriver')
+            os.system('ln -s /home/appuser/venv/lib/python3.7/site-packages/seleniumbase/drivers/geckodriver /home/appuser/venv/bin/geckodriver')
+            return True
+        except Exception as e:
+            st.warning(f"Firefox setup failed: {e}")
+            return False
+    return True
+
+# Detect Streamlit Cloud environment
+ON_STREAMLIT_CLOUD = (
+    os.getenv("STREAMLIT_SHARING_MODE") is not None or 
+    os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
+)
+
+# Setup Firefox if on cloud
+if ON_STREAMLIT_CLOUD:
+    _ = setup_firefox_for_cloud()
+
+# Only disable Selenium if explicitly set to "0"
+ALLOW_SELENIUM = os.getenv("ALLOW_SELENIUM", "1") == "1"
+
+# Detect Streamlit Cloud
+ON_STREAMLIT_CLOUD = (
+    os.getenv("STREAMLIT_SHARING_MODE") is not None or 
+    os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
+)
+
+# Enable Selenium everywhere if allowed (Firefox on cloud, Chrome locally)
+CAN_SELENIUM = HAS_SELENIUM and ALLOW_SELENIUM
 load_dotenv()
 
 # ============================================================================
@@ -1405,6 +1444,8 @@ def mermaid_to_png_via_kroki(mermaid_code: str) -> Optional[bytes]:
 
 # ---- (NEW) Selenium-based fallback PNG renderer (from your Flowchart code) ----
 def mermaid_to_png_via_chrome(mermaid_code: str) -> Optional[bytes]:
+    if not (CAN_SELENIUM and mermaid_code):
+        return None
     if not (HAS_SELENIUM and mermaid_code):
         return None
     html_content = f"""<!doctype html>
@@ -1695,34 +1736,65 @@ def _ensure_flow_state():
 class _SeleniumHelper:
     @staticmethod
     def create_driver(headless: bool, download_dir: Optional[str]):
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from webdriver_manager.chrome import ChromeDriverManager
+        if not CAN_SELENIUM:
+            raise RuntimeError("Selenium is disabled in this environment.")
 
-        options = webdriver.ChromeOptions()
-        if headless: options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--start-maximized")
-        options.add_experimental_option("detach", True)
-        options.add_experimental_option("excludeSwitches", ["enable-logging"])
-
-        if download_dir:
-            os.makedirs(download_dir, exist_ok=True)
-            prefs = {
-                "download.default_directory": os.path.abspath(download_dir),
-                "download.prompt_for_download": False,
-                "download.directory_upgrade": True,
-                "safebrowsing.enabled": True,
-                "profile.default_content_setting_values.automatic_downloads": 1,
-            }
-            options.add_experimental_option("prefs", prefs)
-
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=options
+        # Determine if we're on Streamlit Cloud
+        on_cloud = (
+            os.getenv("STREAMLIT_SHARING_MODE") is not None or 
+            os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
         )
+
+        if on_cloud:
+            # ===== FIREFOX FOR STREAMLIT CLOUD =====
+            from selenium.webdriver import FirefoxOptions
+            
+            options = FirefoxOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            
+            if download_dir:
+                os.makedirs(download_dir, exist_ok=True)
+                options.set_preference("browser.download.folderList", 2)
+                options.set_preference("browser.download.dir", os.path.abspath(download_dir))
+                options.set_preference("browser.download.useDownloadDir", True)
+                options.set_preference("browser.helperApps.neverAsk.saveToDisk", 
+                                    "application/xml,text/xml,image/png")
+            
+            driver = webdriver.Firefox(options=options)
+            
+        else:
+            # ===== CHROME FOR LOCAL DEVELOPMENT =====
+            from selenium.webdriver.chrome.service import Service
+            from webdriver_manager.chrome import ChromeDriverManager
+            
+            options = webdriver.ChromeOptions()
+            if headless: 
+                options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--start-maximized")
+            options.add_experimental_option("detach", True)
+            options.add_experimental_option("excludeSwitches", ["enable-logging"])
+
+            if download_dir:
+                os.makedirs(download_dir, exist_ok=True)
+                prefs = {
+                    "download.default_directory": os.path.abspath(download_dir),
+                    "download.prompt_for_download": False,
+                    "download.directory_upgrade": True,
+                    "safebrowsing.enabled": True,
+                    "profile.default_content_setting_values.automatic_downloads": 1,
+                }
+                options.add_experimental_option("prefs", prefs)
+
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=options
+            )
+        
         driver.set_page_load_timeout(900)
         driver.implicitly_wait(2)
         return driver
@@ -1925,19 +1997,23 @@ class _DrawIO:
             save_btn = wait.until(EC.element_to_be_clickable((By.XPATH, _last_visible_dialog_button_xpath("Export"))))
         _hover_click(save_btn)
 
-        # Wait for a file to appear in download_dir (non-.crdownload, minimal size)
+        # Wait for file - INCREASE TIMEOUT for Firefox on cloud
         before = _SeleniumHelper.get_latest_file(download_dir)
         end = time.time() + timeout_sec
+
+        # Firefox on cloud can be slower
+        wait_increment = 0.5 if ON_STREAMLIT_CLOUD else 0.3
+
         while time.time() < end:
             candidate = _SeleniumHelper.get_latest_file(download_dir)
             if candidate and (before is None or os.path.normpath(candidate) != os.path.normpath(before)):
-                if not candidate.endswith(".crdownload"):
+                if not candidate.endswith(".crdownload") and not candidate.endswith(".part"):  # Firefox uses .part
                     try:
                         if os.path.getsize(candidate) > 2048:
                             return candidate
                     except Exception:
                         return candidate
-            time.sleep(0.3)
+            time.sleep(wait_increment)
 
         raise RuntimeError("XML export timeout (no file downloaded)")
 
@@ -2853,6 +2929,10 @@ elif st.session_state.step == 4:
     def step4_content():
         _ensure_flow_state()
         fs = st.session_state.flow_state
+
+        # NEW: Show environment info
+        if ON_STREAMLIT_CLOUD:
+            st.info("🌐 Running on Streamlit Cloud (Firefox mode) - Some operations may be slower")
 
         st.markdown("#### Flowchart Generation")
 
