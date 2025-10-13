@@ -87,33 +87,33 @@ def _first_exists(paths):
             return p
     return None
 
-chrome_bin = _first_exists(CHROME_BIN_CANDIDATES)
-driver_bin = _first_exists(CHROMEDRIVER_CANDIDATES)
-
-if not chrome_bin:
-    raise RuntimeError("Chromium/Chrome not found. Install via packages.txt.")
-if not driver_bin:
-    raise RuntimeError("chromedriver not found. Install via packages.txt.")
-
-opts = Options()
-opts.binary_location = chrome_bin
-opts.add_argument("--headless=new")
-opts.add_argument("--no-sandbox")
-opts.add_argument("--disable-dev-shm-usage")
-opts.add_argument("--disable-gpu")
-opts.add_argument("--window-size=1920,1080")
-opts.add_argument("--remote-debugging-port=9222")
-# downloads
-prefs = {
-    "download.default_directory": download_dir,
-    "download.prompt_for_download": False,
-    "safebrowsing.enabled": True,
-}
-opts.add_experimental_option("prefs", prefs)
-
-service = Service(executable_path=driver_bin)
-driver = webdriver.Chrome(service=service, options=opts)
-return driver
+    chrome_bin = _first_exists(CHROME_BIN_CANDIDATES)
+    driver_bin = _first_exists(CHROMEDRIVER_CANDIDATES)
+    
+    if not chrome_bin:
+        raise RuntimeError("Chromium/Chrome not found. Install via packages.txt.")
+    if not driver_bin:
+        raise RuntimeError("chromedriver not found. Install via packages.txt.")
+    
+    opts = Options()
+    opts.binary_location = chrome_bin
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--remote-debugging-port=9222")
+    # downloads
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "safebrowsing.enabled": True,
+    }
+    opts.add_experimental_option("prefs", prefs)
+    
+    service = Service(executable_path=driver_bin)
+    driver = webdriver.Chrome(service=service, options=opts)
+    return driver
 
 # ============================================================================
 # Streamlit Cloud Selenium Setup (Firefox via SeleniumBase)
