@@ -1,8 +1,2 @@
-firefox-esr
-chromium
-chromium-driver
-libnss3
-libxss1
-libgbm1
-libasound2
-fonts-dejavu-core
+firefox
+geckodriver
