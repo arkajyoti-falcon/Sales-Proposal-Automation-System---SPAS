@@ -2970,8 +2970,12 @@ elif st.session_state.step == 4:
                     if not code or not code.lower().startswith("flowchart"):
                         st.error("The LLM didn’t return valid Mermaid. Please try again.")
                     else:
-                        st.session_state["mermaid_code"] = code.strip()
+                        code = code.strip()
+                        st.session_state["mermaid_code"] = code
+                        # keep the editor in sync so it doesn't wipe the session value on rerun
+                        st.session_state["mermaid_code_editor"] = code
                         st.success("Flowchart generated from PDF.")
+
 
         # 2) Two columns: Left = Mermaid code | Right = Preview
         PREVIEW_HEIGHT = 520
@@ -2982,13 +2986,13 @@ elif st.session_state.step == 4:
             st.subheader("Mermaid Code")
             mermaid_text = st.text_area(
                 "Editable Mermaid",
-                value=st.session_state.get("mermaid_code", ""),
+                value=st.session_state.get("mermaid_code_editor", st.session_state.get("mermaid_code", "")),
                 key="mermaid_code_editor",
                 height=PREVIEW_HEIGHT,
                 help="Copy this code and paste in mermaid.live for editing."
             )
             # keep session in sync
-            if mermaid_text != st.session_state.get("mermaid_code", ""):
+            if mermaid_text.strip():
                 st.session_state["mermaid_code"] = mermaid_text
             # Actions aligned to original theme
             st.text(" ")
@@ -3022,7 +3026,9 @@ elif st.session_state.step == 4:
                 components.iframe(fs.viewer_url, height=PREVIEW_HEIGHT, scrolling=True)
 
             else:
-                code_for_preview = st.session_state.get("mermaid_code", "").strip()
+                code_for_preview = (st.session_state.get("mermaid_code_editor")
+                    or st.session_state.get("mermaid_code", "")).strip()
+
                 if code_for_preview:
                     safe = sanitize_mermaid_for_render(code_for_preview)
                     render_mermaid_chart(safe, height=PREVIEW_HEIGHT + 20)
