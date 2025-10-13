@@ -77,7 +77,43 @@ try:
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
+CHROME_BIN_CANDIDATES = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
+CHROMEDRIVER_CANDIDATES = ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver"]
 
+def _first_exists(paths):
+    import os
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+chrome_bin = _first_exists(CHROME_BIN_CANDIDATES)
+driver_bin = _first_exists(CHROMEDRIVER_CANDIDATES)
+
+if not chrome_bin:
+    raise RuntimeError("Chromium/Chrome not found. Install via packages.txt.")
+if not driver_bin:
+    raise RuntimeError("chromedriver not found. Install via packages.txt.")
+
+opts = Options()
+opts.binary_location = chrome_bin
+opts.add_argument("--headless=new")
+opts.add_argument("--no-sandbox")
+opts.add_argument("--disable-dev-shm-usage")
+opts.add_argument("--disable-gpu")
+opts.add_argument("--window-size=1920,1080")
+opts.add_argument("--remote-debugging-port=9222")
+# downloads
+prefs = {
+    "download.default_directory": download_dir,
+    "download.prompt_for_download": False,
+    "safebrowsing.enabled": True,
+}
+opts.add_experimental_option("prefs", prefs)
+
+service = Service(executable_path=driver_bin)
+driver = webdriver.Chrome(service=service, options=opts)
+return driver
 
 # ============================================================================
 # Streamlit Cloud Selenium Setup (Firefox via SeleniumBase)
@@ -1854,7 +1890,7 @@ class _DrawIO:
     @staticmethod
     def open_and_insert(mermaid_code: str, headless: bool, download_dir: str):
         from selenium.webdriver.common.action_chains import ActionChains
-        driver = _SeleniumHelper.create_driver(headless=headless, download_dir=download_dir)
+        driver = _SeleniumHelper.create_driver(headless=True, download_dir=download_dir)
         driver.get("https://app.diagrams.net/")
         try:
             ActionChains(driver).pause(0.6).send_keys("\ue00c").perform()  # ESC to close cookie/modals
@@ -3006,7 +3042,7 @@ elif st.session_state.step == 4:
                             except Exception: pass
                         fs.driver = _DrawIO.open_and_insert(
                             st.session_state.get("mermaid_code",""),
-                            headless=False,                 # ALWAYS non-headless
+                            headless=True,                 # ALWAYS non-headless
                             download_dir=fs.download_dir
                         )
                         fs.mode = "drawio"
