@@ -107,7 +107,7 @@ if ON_STREAMLIT_CLOUD:
     _ = setup_firefox_for_cloud()
 
 # Only disable Selenium if explicitly set to "0"
-ALLOW_SELENIUM = os.getenv("ALLOW_SELENIUM", "0") == "0"
+ALLOW_SELENIUM = os.getenv("ALLOW_SELENIUM", "1") == "1"
 
 # Detect Streamlit Cloud
 ON_STREAMLIT_CLOUD = (
