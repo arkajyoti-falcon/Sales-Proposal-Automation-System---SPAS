@@ -1291,6 +1291,16 @@ def extract_relevant_text(pdf_bytes: bytes, max_pages: int = 15) -> str:
     return chosen.strip()
 
 def load_groq() -> Optional[Groq]:
+    """Get or create Groq client - reuse global if available"""
+    global groq_client
+    try:
+        # Try to use existing global client first
+        if groq_client is not None:
+            return groq_client
+    except NameError:
+        pass
+    
+    # Create new client
     key = (os.getenv("GROQ_API_KEY") or "").strip()
     if not key:
         return None
