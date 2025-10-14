@@ -77,82 +77,7 @@ try:
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
-CHROME_BIN_CANDIDATES = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
-CHROMEDRIVER_CANDIDATES = ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver"]
 
-def _first_exists(paths):
-    import os
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    return None
-
-    chrome_bin = _first_exists(CHROME_BIN_CANDIDATES)
-    driver_bin = _first_exists(CHROMEDRIVER_CANDIDATES)
-    
-    if not chrome_bin:
-        raise RuntimeError("Chromium/Chrome not found. Install via packages.txt.")
-    if not driver_bin:
-        raise RuntimeError("chromedriver not found. Install via packages.txt.")
-    
-    opts = Options()
-    opts.binary_location = chrome_bin
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--remote-debugging-port=9222")
-    # downloads
-    prefs = {
-        "download.default_directory": download_dir,
-        "download.prompt_for_download": False,
-        "safebrowsing.enabled": True,
-    }
-    opts.add_experimental_option("prefs", prefs)
-    
-    service = Service(executable_path=driver_bin)
-    driver = webdriver.Chrome(service=service, options=opts)
-    return driver
-
-# ============================================================================
-# Streamlit Cloud Selenium Setup (Firefox via SeleniumBase)
-# ============================================================================
-
-@st.cache_resource
-def setup_firefox_for_cloud():
-    """Install and configure Firefox for Streamlit Cloud"""
-    if ON_STREAMLIT_CLOUD:
-        try:
-            os.system('sbase install geckodriver')
-            os.system('ln -s /home/appuser/venv/lib/python3.7/site-packages/seleniumbase/drivers/geckodriver /home/appuser/venv/bin/geckodriver')
-            return True
-        except Exception as e:
-            st.warning(f"Firefox setup failed: {e}")
-            return False
-    return True
-
-# Detect Streamlit Cloud environment
-ON_STREAMLIT_CLOUD = (
-    os.getenv("STREAMLIT_SHARING_MODE") is not None or 
-    os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
-)
-
-# Setup Firefox if on cloud
-if ON_STREAMLIT_CLOUD:
-    _ = setup_firefox_for_cloud()
-
-# Only disable Selenium if explicitly set to "0"
-ALLOW_SELENIUM = os.getenv("ALLOW_SELENIUM", "1") == "1"
-
-# Detect Streamlit Cloud
-ON_STREAMLIT_CLOUD = (
-    os.getenv("STREAMLIT_SHARING_MODE") is not None or 
-    os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
-)
-
-# Enable Selenium everywhere if allowed (Firefox on cloud, Chrome locally)
-CAN_SELENIUM = HAS_SELENIUM and ALLOW_SELENIUM
 load_dotenv()
 
 # ============================================================================
@@ -583,22 +508,27 @@ def add_page_headers(
     falcon_logo: Optional[bytes],
     client_name: str,
     project_name: str,
-    make_first_page_different: bool = False,
+    make_first_page_different: bool = False,   # NEW: first page has no header/footer if True
 ) -> None:
+    """Add header+footer (logos + text) to the document.
+       If make_first_page_different=True, the first page stays clean (cover page)."""
+
     footer_text = "© FALCON AUTOTECH 2025 Confidential: Not for Distribution. "
     footer_url = "https://www.falconautotech.com/"
 
+    # If we want the first page blank, enable the "Different first page" option
     if make_first_page_different and doc.sections:
         doc.sections[0].different_first_page_header_footer = True
 
     for section in doc.sections:
+        # Always detach from previous so each section can own its header/footer
         section.header.is_linked_to_previous = False
         section.footer.is_linked_to_previous = False
 
         header = section.header
         footer = section.footer
 
-        # Clear header
+        # --- HEADER (clear + rebuild) ---
         try:
             for tbl in list(header.tables):
                 tbl._element.getparent().remove(tbl._element)
@@ -616,40 +546,42 @@ def add_page_headers(
         for cell in row.cells:
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
-        # Left: Client logo
-        if client_logo:
+        client_name = (client_name or
+                    (st.session_state.get("client_name") if hasattr(st, "session_state") else "") or "")
+        project_name = (project_name or
+                        st.session_state.get("project_title") or
+                        st.session_state.get("project_name") or "")
+
+        # Left: FALCON logo  (was client; swapped back)
+        if falcon_logo:
             try:
                 para = row.cells[0].paragraphs[0]
                 run = para.add_run()
-                run.add_picture(io.BytesIO(client_logo), width=Inches(1.0))
+                run.add_picture(io.BytesIO(falcon_logo), width=Inches(1.0))
                 para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             except Exception:
                 pass
 
-        # Middle: text
+        # Middle: exact header copy you want
         header_text = f"FALCON’s Proposal to {client_name} for the {project_name}"
         para_mid = row.cells[1].paragraphs[0]
         run_mid = para_mid.add_run(header_text)
         run_mid.bold = False
         run_mid.font.size = Pt(8)
         run_mid.font.name = "Calibri"
-        try:
-            run_mid._element.rPr.rFonts.set(qn("w:eastAsia"), "Calibri")
-        except Exception:
-            pass
         para_mid.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        # Right: Falcon logo
-        if falcon_logo:
+        # Right: CLIENT logo  (was Falcon; swapped back)
+        if client_logo:
             try:
                 para = row.cells[2].paragraphs[0]
                 run = para.add_run()
-                run.add_picture(io.BytesIO(falcon_logo), width=Inches(1.0))
+                run.add_picture(io.BytesIO(client_logo), width=Inches(1.0))
                 para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
             except Exception:
                 pass
 
-        # Clear footer
+        # --- FOOTER (clear + rebuild) ---
         try:
             for para in list(footer.paragraphs):
                 p_element = para._element
@@ -875,24 +807,48 @@ def create_rfq_response_doc(
     buffer.seek(0)
     return buffer
 
-def merge_docx_files_with_page_breaks(buffers_list: List[Optional[io.BytesIO]]) -> io.BytesIO:
+def merge_docx_files_with_page_breaks(
+    buffers_list: List[Optional[io.BytesIO]],
+    client_logo: Optional[bytes] = None,
+    falcon_logo: Optional[bytes] = None,
+    client_name: str = "",
+    project_name: str = ""
+) -> io.BytesIO:
     if not buffers_list or buffers_list[0] is None:
         raise ValueError("At least one valid document buffer is required as base document.")
 
+    # 1) Load base and FORCE our standard header/footer there
     base_doc = Document(buffers_list[0])
+    try:
+        # This ensures the merged doc inherits the right header/footer
+        add_page_headers(base_doc, client_logo, falcon_logo, client_name, project_name)
+    except Exception:
+        pass
+
+    # 2) Re-link headers/footers on everything we append (so they inherit base header)
+    def _relink_headers(doc_obj: Document):
+        for sec in doc_obj.sections:
+            try:
+                sec.header.is_linked_to_previous = True
+                sec.footer.is_linked_to_previous = True
+            except Exception:
+                pass
+
     composer = Composer(base_doc)
 
     for buf in buffers_list[1:]:
         if buf is None:
             continue
-        _add_page_break(composer.doc)
         doc_to_append = Document(buf)
-        composer.append(doc_to_append)
+        _relink_headers(doc_to_append)  # <- critical
+        _add_page_break(composer.doc)   # just a page break between parts
+        composer.append(doc_to_append)  # headers/footers of this doc are ignored anyway
 
     merged_buffer = io.BytesIO()
     composer.save(merged_buffer)
     merged_buffer.seek(0)
     return merged_buffer
+
 
 # ============================================================================
 # Company Profile Builder (unchanged content)
@@ -1327,16 +1283,6 @@ def extract_relevant_text(pdf_bytes: bytes, max_pages: int = 15) -> str:
     return chosen.strip()
 
 def load_groq() -> Optional[Groq]:
-    """Get or create Groq client - reuse global if available"""
-    global groq_client
-    try:
-        # Try to use existing global client first
-        if groq_client is not None:
-            return groq_client
-    except NameError:
-        pass
-    
-    # Create new client
     key = (os.getenv("GROQ_API_KEY") or "").strip()
     if not key:
         return None
@@ -1490,8 +1436,6 @@ def mermaid_to_png_via_kroki(mermaid_code: str) -> Optional[bytes]:
 
 # ---- (NEW) Selenium-based fallback PNG renderer (from your Flowchart code) ----
 def mermaid_to_png_via_chrome(mermaid_code: str) -> Optional[bytes]:
-    if not (CAN_SELENIUM and mermaid_code):
-        return None
     if not (HAS_SELENIUM and mermaid_code):
         return None
     html_content = f"""<!doctype html>
@@ -1647,7 +1591,8 @@ st.set_page_config(
 # Ensure Falcon logo bytes are available app-wide
 if "falcon_logo" not in st.session_state:
     try:
-        with open("Input\\Static_AboutCompany\\Falcon-Autotech_Logo.png", "rb") as _f:
+        logo_path = os.path.join("Input", "Static_AboutCompany", "Falcon-Autotech_Logo.png")
+        with open(logo_path, "rb") as _f:
             st.session_state.falcon_logo = _f.read()
     except Exception:
         st.session_state.falcon_logo = None
@@ -1782,65 +1727,34 @@ def _ensure_flow_state():
 class _SeleniumHelper:
     @staticmethod
     def create_driver(headless: bool, download_dir: Optional[str]):
-        if not CAN_SELENIUM:
-            raise RuntimeError("Selenium is disabled in this environment.")
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from webdriver_manager.chrome import ChromeDriverManager
 
-        # Determine if we're on Streamlit Cloud
-        on_cloud = (
-            os.getenv("STREAMLIT_SHARING_MODE") is not None or 
-            os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
+        options = webdriver.ChromeOptions()
+        if headless: options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--start-maximized")
+        options.add_experimental_option("detach", True)
+        options.add_experimental_option("excludeSwitches", ["enable-logging"])
+
+        if download_dir:
+            os.makedirs(download_dir, exist_ok=True)
+            prefs = {
+                "download.default_directory": os.path.abspath(download_dir),
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": True,
+                "profile.default_content_setting_values.automatic_downloads": 1,
+            }
+            options.add_experimental_option("prefs", prefs)
+
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
         )
-
-        if on_cloud:
-            # ===== FIREFOX FOR STREAMLIT CLOUD =====
-            from selenium.webdriver import FirefoxOptions
-            
-            options = FirefoxOptions()
-            options.add_argument("--headless")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            
-            if download_dir:
-                os.makedirs(download_dir, exist_ok=True)
-                options.set_preference("browser.download.folderList", 2)
-                options.set_preference("browser.download.dir", os.path.abspath(download_dir))
-                options.set_preference("browser.download.useDownloadDir", True)
-                options.set_preference("browser.helperApps.neverAsk.saveToDisk", 
-                                    "application/xml,text/xml,image/png")
-            
-            driver = webdriver.Firefox(options=options)
-            
-        else:
-            # ===== CHROME FOR LOCAL DEVELOPMENT =====
-            from selenium.webdriver.chrome.service import Service
-            from webdriver_manager.chrome import ChromeDriverManager
-            
-            options = webdriver.ChromeOptions()
-            if headless: 
-                options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--start-maximized")
-            options.add_experimental_option("detach", True)
-            options.add_experimental_option("excludeSwitches", ["enable-logging"])
-
-            if download_dir:
-                os.makedirs(download_dir, exist_ok=True)
-                prefs = {
-                    "download.default_directory": os.path.abspath(download_dir),
-                    "download.prompt_for_download": False,
-                    "download.directory_upgrade": True,
-                    "safebrowsing.enabled": True,
-                    "profile.default_content_setting_values.automatic_downloads": 1,
-                }
-                options.add_experimental_option("prefs", prefs)
-
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager().install()),
-                options=options
-            )
-        
         driver.set_page_load_timeout(900)
         driver.implicitly_wait(2)
         return driver
@@ -1890,7 +1804,7 @@ class _DrawIO:
     @staticmethod
     def open_and_insert(mermaid_code: str, headless: bool, download_dir: str):
         from selenium.webdriver.common.action_chains import ActionChains
-        driver = _SeleniumHelper.create_driver(headless=True, download_dir=download_dir)
+        driver = _SeleniumHelper.create_driver(headless=headless, download_dir=download_dir)
         driver.get("https://app.diagrams.net/")
         try:
             ActionChains(driver).pause(0.6).send_keys("\ue00c").perform()  # ESC to close cookie/modals
@@ -2043,23 +1957,19 @@ class _DrawIO:
             save_btn = wait.until(EC.element_to_be_clickable((By.XPATH, _last_visible_dialog_button_xpath("Export"))))
         _hover_click(save_btn)
 
-        # Wait for file - INCREASE TIMEOUT for Firefox on cloud
+        # Wait for a file to appear in download_dir (non-.crdownload, minimal size)
         before = _SeleniumHelper.get_latest_file(download_dir)
         end = time.time() + timeout_sec
-
-        # Firefox on cloud can be slower
-        wait_increment = 0.5 if ON_STREAMLIT_CLOUD else 0.3
-
         while time.time() < end:
             candidate = _SeleniumHelper.get_latest_file(download_dir)
             if candidate and (before is None or os.path.normpath(candidate) != os.path.normpath(before)):
-                if not candidate.endswith(".crdownload") and not candidate.endswith(".part"):  # Firefox uses .part
+                if not candidate.endswith(".crdownload"):
                     try:
                         if os.path.getsize(candidate) > 2048:
                             return candidate
                     except Exception:
                         return candidate
-            time.sleep(wait_increment)
+            time.sleep(0.3)
 
         raise RuntimeError("XML export timeout (no file downloaded)")
 
@@ -2173,7 +2083,7 @@ def ensure_falcon_section_title_style(doc,
 
 def _require_valid_png(png_bytes: bytes) -> bytes:
     """Decode + sanity check + crop + flatten. Raise if not usable."""
-    if not png_bytes or len(png_bytes) < 100:  # Changed from checking dimensions
+    if not png_bytes or len(png_bytes) < 100:
         raise ValueError("Flowchart PNG missing or too small.")
     
     try:
@@ -2182,16 +2092,30 @@ def _require_valid_png(png_bytes: bytes) -> bytes:
     except Exception as e:
         raise ValueError(f"Flowchart PNG is corrupt: {e}")
 
-    # Remove the 8x8 dimension check - allow any valid decoded image
-    
-    # crop transparent/near-white borders
+    # Convert to RGB if needed (Word doesn't like some PNG modes)
+    if im.mode not in ("RGB", "L"):
+        if im.mode == "RGBA":
+            # Flatten alpha onto white background
+            bg = PILImage.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+
+    # Auto-crop white/transparent borders
     bbox = None
-    if im.mode == "RGBA":
-        bbox = im.getchannel("A").getbbox()
-    if not bbox:
-        gray = ImageOps.grayscale(im.convert("RGB"))
-        bg = gray.point(lambda p: 255 if p > 245 else 0)
-        bbox = ImageOps.invert(bg).getbbox()
+    if im.mode == "L":
+        # Grayscale
+        extrema = im.getextrema()
+        if extrema[0] < 250:  # Has non-white content
+            gray = im.point(lambda p: 0 if p > 245 else 255)
+            bbox = gray.getbbox()
+    else:
+        # RGB
+        gray = ImageOps.grayscale(im)
+        bg = gray.point(lambda p: 0 if p > 245 else 255)
+        bbox = bg.getbbox()
+
     if bbox:
         im = im.crop(bbox)
 
@@ -2199,12 +2123,7 @@ def _require_valid_png(png_bytes: bytes) -> bytes:
     if im.width < 50 or im.height < 50:
         raise ValueError(f"Flowchart image too small after cropping ({im.width}x{im.height})")
 
-    # flatten alpha onto white
-    if im.mode == "RGBA":
-        bg = PILImage.new("RGB", im.size, (255, 255, 255))
-        bg.paste(im, mask=im.split()[-1])
-        im = bg
-
+    # Save as optimized PNG in RGB mode
     out = io.BytesIO()
     im.save(out, format="PNG", optimize=True)
     out.seek(0)
@@ -2214,44 +2133,97 @@ def _docx_from_png_onepage(png_bytes: bytes,
                            title: str,
                            client_logo=None, falcon_logo=None,
                            client_name="", project_name="") -> io.BytesIO:
-    """Build an A4 portrait one-pager with the PNG filling the printable area."""
+    """Build an A4 portrait one-pager with the PNG fitting properly."""
     doc = Document()
-    # headers/footers if you already have a helper:
+    
+    # Add headers/footers
     try:
         add_page_headers(doc, client_logo, falcon_logo, client_name, project_name)
     except Exception:
         pass
 
-    # Force A4 portrait (inches)
+    # Force A4 portrait
     section = doc.sections[0]
-    section.page_width  = Inches(8.27)
+    section.page_width = Inches(8.27)
     section.page_height = Inches(11.69)
-    # Leave whatever margins your header/footer logic expects
+    section.top_margin = Inches(1.0)
+    section.bottom_margin = Inches(1.0)
+    section.left_margin = Inches(0.75)
+    section.right_margin = Inches(0.75)
 
     # Title
     if title:
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        title_style = ensure_falcon_section_title_style(doc)
-        p = doc.add_paragraph(title, style=title_style)
+        run_title = p.add_run(title)
+        run_title.font.name = "Calibri"
+        run_title.font.size = Pt(14)
+        run_title.bold = True
+        run_title.underline = True
+        run_title.font.color.rgb = RGBColor(2, 12, 115)
 
+    # Calculate maximum image dimensions
+    max_width = 8.27 - 0.75 - 0.75  # page width - left - right margins = 6.77"
+    max_height = 11.69 - 1.0 - 1.0 - 0.5  # page height - top - bottom - title space = 9.19"
 
-    # Compute max width within current margins
-    left = float(section.left_margin.inches)
-    right = float(section.right_margin.inches)
-    top = float(section.top_margin.inches)
-    bottom = float(section.bottom_margin.inches)
-
-    max_w = 8.27 - left - right
-    # Leave a little vertical space for title; scale by width and let Word keep aspect
-    image_stream = io.BytesIO(png_bytes)
-    doc.add_paragraph("")  # spacer
-    run = doc.add_paragraph().add_run()
-    run.add_picture(image_stream, width=Inches(max_w))
+    # Load image to get dimensions
+    try:
+        im = PILImage.open(io.BytesIO(png_bytes))
+        img_width_px, img_height_px = im.size
+        
+        # Calculate aspect ratio
+        aspect_ratio = img_width_px / img_height_px
+        
+        # Determine best fit
+        if img_width_px / max_width > img_height_px / max_height:
+            # Width is the constraint
+            final_width = max_width
+            final_height = final_width / aspect_ratio
+        else:
+            # Height is the constraint
+            final_height = max_height
+            final_width = final_height * aspect_ratio
+        
+        # Add small spacer
+        doc.add_paragraph("")
+        
+        # Add image with calculated dimensions
+        p_img = doc.add_paragraph()
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_img = p_img.add_run()
+        
+        # Use the optimized PNG bytes directly
+        run_img.add_picture(io.BytesIO(png_bytes), width=Inches(final_width))
+        
+    except Exception as e:
+        # Fallback: use max width
+        doc.add_paragraph("")
+        p_img = doc.add_paragraph()
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_img = p_img.add_run()
+        run_img.add_picture(io.BytesIO(png_bytes), width=Inches(6.5))
 
     buf = io.BytesIO()
-    doc.save(buf); buf.seek(0)
+    doc.save(buf)
+    buf.seek(0)
     return buf
+
+
+def _ensure_images_embedded(docx_buffer: io.BytesIO) -> io.BytesIO:
+    """Re-save document to ensure images are properly embedded."""
+    try:
+        docx_buffer.seek(0)
+        doc = Document(docx_buffer)
+        
+        # Force re-save (this re-embeds all images)
+        out = io.BytesIO()
+        doc.save(out)
+        out.seek(0)
+        return out
+    except Exception:
+        # If re-save fails, return original
+        docx_buffer.seek(0)
+        return docx_buffer
 
 def _auto_refresh_drawio_preview() -> bool:
     """
@@ -2350,7 +2322,55 @@ def _auto_refresh_drawio_preview() -> bool:
             st.error(f"❌ Refresh failed: {error_msg}")
         
         return False
+def _docx_from_png_via_tempfile(png_bytes: bytes,
+                                title: str,
+                                client_logo=None, falcon_logo=None,
+                                client_name="", project_name="") -> io.BytesIO:
+    """Build flowchart page using temporary file (more reliable for docxcompose)."""
+    import tempfile
+    
+    doc = Document()
+    try:
+        add_page_headers(doc, client_logo, falcon_logo, client_name, project_name)
+    except Exception:
+        pass
 
+    section = doc.sections[0]
+    section.page_width = Inches(8.27)
+    section.page_height = Inches(11.69)
+
+    if title:
+        p = doc.add_paragraph()
+        run_title = p.add_run(title)
+        run_title.font.name = "Calibri"
+        run_title.font.size = Pt(14)
+        run_title.bold = True
+        run_title.underline = True
+        run_title.font.color.rgb = RGBColor(2, 12, 115)
+
+    doc.add_paragraph("")
+    
+    # Save PNG to temporary file
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(png_bytes)
+        tmp_path = tmp.name
+    
+    try:
+        p_img = doc.add_paragraph()
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_img = p_img.add_run()
+        run_img.add_picture(tmp_path, width=Inches(6.5))
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
 def _auto_crop_png_whitespace(png_bytes: bytes) -> bytes:
     """
     Crop transparent/near-white borders and flatten to RGB to avoid Word/Office
@@ -2976,10 +2996,6 @@ elif st.session_state.step == 4:
         _ensure_flow_state()
         fs = st.session_state.flow_state
 
-        # NEW: Show environment info
-        if ON_STREAMLIT_CLOUD:
-            st.info("🌐 Running on Streamlit Cloud (Firefox mode) - Some operations may be slower")
-
         st.markdown("#### Flowchart Generation")
 
         # 1) Generate Mermaid from solution PDF
@@ -3006,12 +3022,8 @@ elif st.session_state.step == 4:
                     if not code or not code.lower().startswith("flowchart"):
                         st.error("The LLM didn’t return valid Mermaid. Please try again.")
                     else:
-                        code = code.strip()
-                        st.session_state["mermaid_code"] = code
-                        # keep the editor in sync so it doesn't wipe the session value on rerun
-                        st.session_state["mermaid_code_editor"] = code
+                        st.session_state["mermaid_code"] = code.strip()
                         st.success("Flowchart generated from PDF.")
-
 
         # 2) Two columns: Left = Mermaid code | Right = Preview
         PREVIEW_HEIGHT = 520
@@ -3022,13 +3034,13 @@ elif st.session_state.step == 4:
             st.subheader("Mermaid Code")
             mermaid_text = st.text_area(
                 "Editable Mermaid",
-                value=st.session_state.get("mermaid_code_editor", st.session_state.get("mermaid_code", "")),
+                value=st.session_state.get("mermaid_code", ""),
                 key="mermaid_code_editor",
                 height=PREVIEW_HEIGHT,
                 help="Copy this code and paste in mermaid.live for editing."
             )
             # keep session in sync
-            if mermaid_text.strip():
+            if mermaid_text != st.session_state.get("mermaid_code", ""):
                 st.session_state["mermaid_code"] = mermaid_text
             # Actions aligned to original theme
             st.text(" ")
@@ -3042,7 +3054,7 @@ elif st.session_state.step == 4:
                             except Exception: pass
                         fs.driver = _DrawIO.open_and_insert(
                             st.session_state.get("mermaid_code",""),
-                            headless=True,                 # ALWAYS non-headless
+                            headless=False,                 # ALWAYS non-headless
                             download_dir=fs.download_dir
                         )
                         fs.mode = "drawio"
@@ -3062,9 +3074,7 @@ elif st.session_state.step == 4:
                 components.iframe(fs.viewer_url, height=PREVIEW_HEIGHT, scrolling=True)
 
             else:
-                code_for_preview = (st.session_state.get("mermaid_code_editor")
-                    or st.session_state.get("mermaid_code", "")).strip()
-
+                code_for_preview = st.session_state.get("mermaid_code", "").strip()
                 if code_for_preview:
                     safe = sanitize_mermaid_for_render(code_for_preview)
                     render_mermaid_chart(safe, height=PREVIEW_HEIGHT + 20)
@@ -3102,10 +3112,9 @@ elif st.session_state.step == 4:
                     elapsed = time.time() - fs.last_refresh_ts
                     if elapsed < 3:  # 3-second cooldown
                         can_refresh = False
-                        st.caption(f"⏳ Wait {3-int(elapsed)}s")
-
+                        
                 if st.button("↻", key="refresh_now_btn", help="Refresh preview from diagrams.net"):
-                    with st.spinner("Exporting...", show_time=True):
+                    with st.spinner("Exporting", show_time=True):
                         success = _auto_refresh_drawio_preview()
                         if success:
                             st.rerun()
@@ -3165,6 +3174,25 @@ elif st.session_state.step == 4:
                         mermaid_code = st.session_state.get("mermaid_code", "")
                         if mermaid_code.strip():
                             png_bytes = mermaid_to_png_via_kroki(mermaid_code)
+                            if png_bytes and len(png_bytes) > 0:
+                                try:
+                                    # Validate the PNG before proceeding
+                                    test_img = PILImage.open(io.BytesIO(png_bytes))
+                                    test_img.load()
+                                    
+                                    # Check if it's a valid size
+                                    if test_img.width < 100 or test_img.height < 100:
+                                        st.warning(f"⚠️ PNG is very small ({test_img.width}x{test_img.height}). This may cause display issues.")
+                                    else:
+                                        st.success(f"✅ Valid PNG captured: {test_img.width}x{test_img.height} pixels ({len(png_bytes)} bytes)")
+                                        
+                                    # Convert to RGB if needed
+                                    if test_img.mode not in ("RGB", "L"):
+                                        st.info(f"🔄 Converting PNG from {test_img.mode} to RGB for better Word compatibility")
+                                        
+                                except Exception as e:
+                                    st.error(f"❌ PNG validation failed: {e}")
+                                    st.stop()
                             if not png_bytes:
                                 # Try Chrome fallback
                                 png_bytes = mermaid_to_png_via_chrome(mermaid_code)
@@ -3422,7 +3450,16 @@ elif st.session_state.step == 5:
 
         if gen_btn:
             try:
-                merged_buffer = merge_docx_files_with_page_breaks(parts)
+                if flow:
+                    flow = _ensure_images_embedded(flow)
+                    st.session_state.flowchart_docx_buffer = flow
+                merged_buffer = merge_docx_files_with_page_breaks(
+                parts,
+                client_logo = st.session_state.get("client_logo"),
+                falcon_logo = st.session_state.get("falcon_logo"),
+                client_name = st.session_state.get("client_name",""),
+                project_name = st.session_state.get("project_title","")
+                )
                 st.session_state["final_docx_bytes"] = merged_buffer.getvalue()
 
                 st.success("Final proposal created successfully!")
