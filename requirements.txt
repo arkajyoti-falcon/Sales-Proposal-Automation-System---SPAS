@@ -130,3 +130,4 @@ wsproto
 xlsxwriter
 zope.event
 zope.interface
+chromium-browser
