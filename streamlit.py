@@ -693,7 +693,7 @@ def call_groq_exec_summary(system_text: str, client_name: str, project_title: st
 # ==================== COMMERCIAL/GROQ FUNCTIONS ====================
 
 # Groq client for price sheet generation
-groq_client = Groq(api_key="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")
+groq_client = Groq.getenv("GROQ_API_KEY")
 
 GROQ_SYSTEM_PROMPT = """
 You are a senior commercial analyst for warehouse automation projects.
