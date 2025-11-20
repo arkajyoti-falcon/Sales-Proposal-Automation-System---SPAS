@@ -6,6 +6,7 @@ from io import BytesIO
 from docx import Document
 from groq import Groq
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
@@ -20,7 +21,7 @@ st.write(
 # -----------------------------
 # CONFIG – Groq client & prompts
 # -----------------------------
-client = Groq(api_key="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")
+client = os.getenv("GROQ_API_KEY")
 
 SYSTEM_PROMPT = """
 You are a senior commercial analyst for warehouse automation projects.
