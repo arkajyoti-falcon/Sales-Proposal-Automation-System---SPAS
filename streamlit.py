@@ -72,45 +72,6 @@ COMPONENT_IMAGES = {
     "carrier_position": r"FIXED_IMAGE\CPS.PNG",
 }
 
-# ==================== GLOSSARY MASTER LIST ====================
-GLOSSARY_ENTRIES = [
-    ("RFQ", "Request For Quotation"),
-    ("RFP", "Request For Proposal"),
-    ("PPH", "Parcels / Shipments Per Hour"),
-    ("ARB", "Actuated Roller Balls"),
-    ("DBO", "Damaged Barcode"),
-    ("VDS", "Volume Distribution System"),
-    ("ICR", "Intelligent Character Recognition"),
-    ("MEZZ", "Mezzanine"),
-    ("LIM", "Linear Induction Motor"),
-    ("LSM", "Linear Synchronous Motor"),
-    ("FWD", "Friction Wheel Drive"),
-    ("ECDS", "Empty Carrier Detection System"),
-    ("AC", "Alternating Current"),
-    ("DC", "Direct Current"),
-    ("PLC", "Programmable Logic Controller"),
-    ("IT", "Information Technology"),
-    ("BOQ", "Bill Of Quantity"),
-    ("I/O", "Input/ Output"),
-    ("PDP", "Power Distribution Panel"),
-    ("PC", "Personal Computer"),
-    ("UPS", "Uninterrupted Power Supply"),
-    ("CBS", "Cross Belt Sorter"),
-    ("MDR", "Motor Driven Roller"),
-    ("IPP", "Individual Productivity Potential"),
-    ("VM", "Virtual Machine"),
-    ("MENA", "Middle East North Africa"),
-    ("FOC", "Free of Cost"),
-    ("CEP", "Courier Express Parcel"),
-    ("DAP", "Design Approval Phase"),
-    ("DNF", "Data Not Found"),
-    ("LGM", "Logic Mismatch"),
-    ("RTVC", "Real Time Video Coding"),
-    ("NL Shipments", "Non-Large Shipments"),
-    ("SL Shipments", "Semi-Large Shipments"),
-    ("NO(S)", "Piece(s)"),
-]
-
 # ==================== RETRY WRAPPER FOR RATE LIMITS ====================
 def call_groq_with_retry(api_call_func, max_retries=5, initial_delay=2):
     """Wrapper to retry GROQ API calls with exponential backoff on rate limits."""
@@ -137,46 +98,6 @@ def call_groq_with_retry(api_call_func, max_retries=5, initial_delay=2):
                 raise  # Re-raise non-rate-limit errors immediately
     
     raise RuntimeError(f"Failed after {max_retries} retries")
-
-# ==================== GLOSSARY UTILITIES ====================
-
-def extract_full_text_from_docx(doc: Document) -> str:
-    """Concatenate all paragraph and table text from the DOCX."""
-    parts = []
-    for p in doc.paragraphs:
-        if p.text:
-            parts.append(p.text)
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if cell.text:
-                    parts.append(cell.text)
-
-    return "\n".join(parts)
-
-
-def find_terms_in_text(text: str):
-    """
-    Return list of (term, description) that actually appear in the text.
-    Matching is done as a whole word, case-sensitive, to avoid accidental
-    matches of 'it' vs 'IT'.
-    """
-    found = []
-    for term, desc in GLOSSARY_ENTRIES:
-        # Build safe regex – whole word / token
-        pattern = r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])"
-        if re.search(pattern, text):
-            found.append((term, desc))
-
-    # keep original order, no duplicates
-    seen = set()
-    unique = []
-    for t, d in found:
-        if t not in seen:
-            seen.add(t)
-            unique.append((t, d))
-    return unique
 
 # ==================== DXF COMPONENT EXTRACTION ====================
 
@@ -3044,77 +2965,8 @@ def build_front_page_section(doc, project_title, offer_ref, contact_name, contac
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 
-def build_glossary_section(doc, detected_terms):
-    """Build Glossary section with table of detected terms - inserted before Executive Summary"""
-    doc.add_page_break()
-    
-    # Add heading using standard formatting
-    add_numbered_heading(doc, "Glossary", level=1, counter=None)
-    
-    if not detected_terms:
-        p = doc.add_paragraph("No glossary terms detected in this document.")
-        apply_normal_style(p)
-        return
-    
-    # Create table with 3 columns: S. No., Term, Description
-    table = doc.add_table(rows=1, cols=3)
-    apply_table_style(table)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    
-    # Header row
-    hdr_cells = table.rows[0].cells
-    headers = ["S. No.", "Term", "Description"]
-    for i, text in enumerate(headers):
-        p = hdr_cells[i].paragraphs[0]
-        p.text = ""
-        run = p.add_run(text)
-        run.font.name = 'Calibri'
-        run.font.size = Pt(11)
-        run.font.bold = True
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-    
-    # Data rows
-    for idx, (term, desc) in enumerate(detected_terms, start=1):
-        row_cells = table.add_row().cells
-        
-        # S. No.
-        p0 = row_cells[0].paragraphs[0]
-        p0.text = ""
-        r0 = p0.add_run(str(idx))
-        r0.font.name = 'Calibri'
-        r0.font.size = Pt(11)
-        r0.font.bold = True
-        p0.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        row_cells[0].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        
-        # Term
-        p1 = row_cells[1].paragraphs[0]
-        p1.text = ""
-        r1 = p1.add_run(term)
-        r1.font.name = 'Calibri'
-        r1.font.size = Pt(11)
-        r1.font.bold = True
-        p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        row_cells[1].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        
-        # Description
-        p2 = row_cells[2].paragraphs[0]
-        p2.text = ""
-        r2 = p2.add_run(desc)
-        r2.font.name = 'Calibri'
-        r2.font.size = Pt(11)
-        p2.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        row_cells[2].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-    
-    # Set column widths
-    table.columns[0].width = Inches(0.8)
-    table.columns[1].width = Inches(1.5)
-    table.columns[2].width = Inches(4.2)
-
-
-def build_table_of_contents_section(doc):
-    """Build table of contents section with automatic TOC"""
+def build_glossary_section(doc):
+    """Build glossary/table of contents section with automatic TOC"""
     doc.add_page_break()
     
     p = doc.add_heading("Table of Contents", level=1)
@@ -5707,8 +5559,8 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             if cover_letter_text:
                 build_front_page_section(doc, project_name, offer_ref, contact_name, contact_email, contact_phone, layout_png_path)
             
-            # ==================== TABLE OF CONTENTS ====================
-            build_table_of_contents_section(doc)
+            # ==================== GLOSSARY ====================
+            build_glossary_section(doc)
             
             # Start numbering from 1
             counter = 1
@@ -5855,85 +5707,6 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             if exclusion_include:
                 build_exclusions_section(doc, counter, selected_exclusions)
                 counter += 1
-            
-            # ==================== EXTRACT GLOSSARY TERMS FROM COMPLETE DOCUMENT ====================
-            st.info("🔍 Scanning document for glossary terms...")
-            
-            # Save document to buffer to extract text
-            temp_buffer = io.BytesIO()
-            doc.save(temp_buffer)
-            temp_buffer.seek(0)
-            
-            # Load document and extract all text
-            temp_doc = Document(temp_buffer)
-            full_text = extract_full_text_from_docx(temp_doc)
-            
-            # Find terms that appear in the document
-            detected_terms = find_terms_in_text(full_text)
-            
-            if detected_terms:
-                st.success(f"✓ Found {len(detected_terms)} glossary terms in the document")
-                
-                # Now we need to insert glossary BEFORE Executive Summary
-                # We'll create a new document with proper section order
-                
-                # Save current document to buffer
-                current_doc_buffer = io.BytesIO()
-                doc.save(current_doc_buffer)
-                current_doc_buffer.seek(0)
-                
-                # Load it back
-                doc = Document(current_doc_buffer)
-                
-                # Create new document with glossary inserted before Executive Summary
-                new_doc = Document()
-                ensure_list_styles(new_doc)
-                
-                # Set default font
-                style = new_doc.styles['Normal']
-                font = style.font
-                font.name = 'Calibri (Body)'
-                font.size = Pt(11)
-                
-                # Add header/footer to new document
-                create_header_footer(new_doc, client_name, project_name, None, client_logo_path)
-                
-                # Copy all content up to (but not including) Executive Summary
-                # Then insert Glossary, then copy rest
-                
-                # For simplicity, we'll insert glossary sections at the correct position
-                # by tracking when we hit the Executive Summary heading
-                
-                exec_summary_found = False
-                glossary_inserted = False
-                
-                for element in doc.element.body:
-                    # Check if this is the Executive Summary paragraph
-                    if element.tag.endswith('p'):
-                        para_text = ''.join([t.text for t in element.xpath('.//w:t', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})])
-                        
-                        # If we find "Executive Summary" or "1. Executive Summary", insert glossary before it
-                        if not glossary_inserted and ('Executive Summary' in para_text or 'EXECUTIVE SUMMARY' in para_text.upper()):
-                            # Insert glossary here
-                            build_glossary_section(new_doc, detected_terms)
-                            glossary_inserted = True
-                    
-                    # Copy the element to new document
-                    new_doc.element.body.append(element)
-                
-                # If glossary wasn't inserted (Executive Summary not found), add it at the beginning
-                if not glossary_inserted:
-                    st.warning("Could not locate Executive Summary section - glossary added at beginning")
-                    # Create a temporary doc with glossary
-                    temp_glossary_doc = Document()
-                    build_glossary_section(temp_glossary_doc, detected_terms)
-                    # Insert at beginning of new_doc
-                    for element in temp_glossary_doc.element.body:
-                        new_doc.element.body.insert(0, element)
-                
-                doc = new_doc
-            else:
-                st.info("ℹ️ No glossary terms detected in the document")
             
             # ==================== INSERT COVER PAGE AT BEGINNING ====================
             # Now prepend cover page at the beginning if cover letter was generated
