@@ -1,0 +1,12 @@
+streamlit
+pandas
+python-docx
+Pillow
+groq
+python-dotenv
+docxcompose
+pdfplumber
+ezdxf
+requests
+convertapi
+openpyxl

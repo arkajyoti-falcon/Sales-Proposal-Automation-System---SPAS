@@ -1,0 +1,609 @@
+{
+  "training_examples": [
+    {
+      "example_id": 1,
+      "system_type": "Linear Cross-Belt Sorter",
+      "capacity": "6000 PPH",
+      "process_flow": {
+        "infeed_system": {
+          "description": "Boxes and totes are loaded onto the existing conveyor in a lengthwise orientation. From there, they are directed to their assigned highway line, which transports them to the CBS induct zone in a singulated manner.",
+          "components": [
+            "Manual loading lines",
+            "Inclined conveyor",
+            "Highway conveyor"
+          ]
+        },
+        "inducts": {
+          "description": "Fully automatic induct line accurately and smoothly inducts the parcels onto the Linear CBS, based on their dimensions and weight.",
+          "type": "Automatic"
+        },
+        "sorter": {
+          "description": "Cross-Belt Sorter captures barcode details and volume data after which it efficiently sorts the boxes and totes into their designated output chutes.",
+          "type": "Linear CBS"
+        },
+        "output_chutes": {
+          "live_chutes": {
+            "quantity": 9,
+            "type": "Sliding-type",
+            "description": "Integrated with PVC belt conveyors and TBCs for live loading"
+          },
+          "collection_chutes": {
+            "quantity": 20,
+            "type": "Friction roller-based",
+            "description": "Designed to collect and gradually accumulate the parcels"
+          },
+          "rejection_chute": {
+            "quantity": 1,
+            "type": "Friction roller-based",
+            "description": "Handles rejected shipments"
+          }
+        },
+        "recirculation_line": {
+          "description": "Automatically feeds sortfail parcels back into the Linear CBS. Also integrated with a manual loading point for reprocessed boxes and totes collected from the rejection chute."
+        }
+      },
+      "system_description": {
+        "infeed_system": {
+          "overview": "System equipped with three infeed conveyors, facilitating movement of shipments from lower level to mezzanine level",
+          "components": {
+            "straight_belt_conveyor": {
+              "belt_width": "1000 mm",
+              "belt_material": "PVC",
+              "belt_thickness": "3 mm",
+              "load_capacity": "50 kg/m",
+              "motor_type": "AC Geared Motor",
+              "gear_motor_make": "Sew/Nord",
+              "drive_make": "Lenze/Siemens/Omron/Allen Bradly"
+            },
+            "inclined_pvc_conveyor": {
+              "description": "Used for smooth conveying over inclined paths",
+              "features": ["Low Noise", "Maximum uptime", "Minimal maintenance", "High safety standards"]
+            },
+            "buffer_conveyor": {
+              "description": "Temporarily stores or holds items in controlled manner to manage flow between stages",
+              "purpose": "Maintain throughput of line"
+            },
+            "angle_merge": {
+              "angle": "30°",
+              "type": "Triangular high-speed conveyor",
+              "belt_type": "Strip Belts"
+            },
+            "side_aligner": {
+              "description": "Roller aligner conveyor for parcel alignment"
+            }
+          },
+          "conveyor_boq_summary": {
+            "total_pvc_conveyors": 63,
+            "buffer_conveyors": 10,
+            "belt_merge_30_degree": 5,
+            "belt_turn_90_degree": 16,
+            "belt_turn_60_degree": 5,
+            "aligning_conveyors": 5
+          }
+        },
+        "induction_to_sorter": {
+          "feedlines": {
+            "quantity": 3,
+            "type": "Fully Automatic",
+            "designed_ipp": "3000 PPH",
+            "modules_per_feedline": {
+              "weighing_conveyor": 1,
+              "receiving_conveyor": 1,
+              "spacing_conveyor": 2,
+              "short_buffer_conveyor": 10,
+              "angle_merge": 2
+            }
+          },
+          "weighing_conveyor": {
+            "description": "Measures weight of materials as they move along conveyor belt",
+            "equipment": "High precision Load Cells",
+            "make": "Bizerba/Mettler Toledo"
+          },
+          "receiving_conveyor": {
+            "description": "Receives and releases products for induction onto CBS"
+          },
+          "buffer_conveyors": {
+            "description": "Temporarily stores items to manage flow and maintain throughput"
+          }
+        },
+        "linear_sorter": {
+          "installation_level": "Ground level",
+          "sorter_height": "1700 mm from ground",
+          "carrier_type": "Single belt carriers",
+          "carrier_pitch": "500 mm",
+          "belt_size": "495 x 800 mm",
+          "top_running_length": "81 m",
+          "total_length": "164.5 m",
+          "number_of_carriers": 333,
+          "operation": "As parcel passes through barcode scanning tunnel, barcodes are scanned and chutes are assigned. Carrier actuates to drop parcel in assigned chute."
+        },
+        "sorting_output": {
+          "live_chute": {
+            "type": "Direct Loading Type",
+            "quantity": 9,
+            "components": ["Collection chute", "PVC belt conveyor", "TBC"],
+            "description": "Collection chute brings down sorted parcel and releases to running conveyor for direct loading into trucks"
+          },
+          "collection_chute": {
+            "type": "Friction Roller Type",
+            "quantity": 20,
+            "dimensions": "5.6m x 1m x 0.3m",
+            "capacity_volume": "26 parcels (assuming 100% occupancy)",
+            "capacity_length": "14 parcels (assuming 100% occupancy)",
+            "equipment": {
+              "chute_full_sensors": 1,
+              "three_color_tower_light": 1,
+              "push_button": 1
+            }
+          },
+          "rejection_chute": {
+            "type": "Friction Roller Type",
+            "quantity": 1,
+            "dimensions": "5.6m x 1m x 0.3m",
+            "capacity_volume": "26 parcels (assuming 100% occupancy)",
+            "capacity_length": "14 parcels (assuming 100% occupancy)",
+            "equipment": {
+              "chute_full_sensors": 1,
+              "three_color_tower_light": 1,
+              "push_button": 1
+            }
+          }
+        },
+        "recirculation_and_manual_feed": {
+          "recirculation_line": {
+            "description": "Strategically designed at end of Linear CBS to manage parcels with sorting failures. Automated line gathers and transports sort-failed parcels, refeeding them back without additional manual labor."
+          },
+          "manual_refeed_line": {
+            "description": "Integrated with recirculation line to enable reintroduction of rejected parcels that have been manually reprocessed"
+          },
+          "conveyor_boq_summary": {
+            "pvc_belt_conveyors": 8,
+            "pvc_belt_conveyors_s3": 6,
+            "buffer_conveyors": 2,
+            "belt_merge_30_degree": 1,
+            "belt_turns": 3,
+            "aligning_conveyors": 2
+          }
+        }
+      }
+    },
+    {
+      "example_id": 2,
+      "system_type": "Loop Cross-Belt Sorter with Auto and Manual Induct",
+      "process_flow": {
+        "auto_infeed_system": {
+          "description": "Shipments are placed on the auto infeed lines in singulated manner. The shipments ascend to a higher level (on induct) via an inclined conveyor."
+        },
+        "auto_induct_line": {
+          "description": "Shipments coming from auto infeed conveyors will be inducted on Loop Cross Belt Sorter automatically."
+        },
+        "manual_induct_station": {
+          "description": "On mezzanine manual station for induction is planned. Operator will collect the parcels and place directly on the Loop Cross Belt Sorter.",
+          "location": "Mezzanine"
+        },
+        "loop_cbs": {
+          "description": "Cross-Belt Sorter efficiently sorts the shipments into their respective output chutes by utilizing sorting logic.",
+          "type": "Loop CBS"
+        },
+        "output_chutes": {
+          "description": "Shipments are discharged into double decker types of chutes. Chutes and transferring plates connected to Loop CBS."
+        }
+      },
+      "system_description": {
+        "auto_infeed_conveyor": {
+          "straight_and_inclined_conveyor": {
+            "belt_width": "1200 mm",
+            "belt_material": "PVC",
+            "belt_thickness": "3 mm",
+            "load_capacity": "30 kg/m",
+            "motor_type": "AC Geared Motor",
+            "gear_motor_make": "Sew/Nord/Lenze",
+            "drive_make": "Lenze/Siemens/Omron/Allen Bradly",
+            "features": ["Low Noise", "Maximum uptime", "Minimal maintenance", "High safety standards", "Fastest ROI"]
+          },
+          "conveyor_boq": {
+            "pvc_belt_conveyors": 3,
+            "pvc_belt_conveyor_with_curve": 1,
+            "curve_conveyor_60_degree": 1,
+            "inclined_conveyors": 3
+          }
+        },
+        "feedlines_auto_induct": {
+          "quantity": 2,
+          "capacity_per_feedline": "3000 PPH",
+          "modules": {
+            "buffer_conveyor": 4,
+            "spacing_conveyor": 2,
+            "angle_merge": 1
+          },
+          "buffer_conveyors": {
+            "description": "Temporarily stores items to manage flow between stages when there is mismatch in speeds or capacities",
+            "purpose": "Maintain throughput of line"
+          },
+          "spacing_conveyor": {
+            "description": "Variable speed special purpose module that creates space between parcels and regulates feeding",
+            "also_known_as": "Gapping conveyor or gap optimizer"
+          },
+          "angle_merge_conveyor": {
+            "angle": "30°",
+            "type": "Triangular high-speed conveyor",
+            "belt_type": "Strip Belts",
+            "description": "Incorporates advanced automation to intelligently merge streams into single unified flow"
+          }
+        },
+        "manual_induct_stations": {
+          "description": "Manual induct station planned to induct parcels directly on Cross Belt Sorter by operator",
+          "location": "Mezzanine"
+        },
+        "loop_cross_belt_sorter": {
+          "installation_level": "Ground level",
+          "sorter_height": "2900 mm from ground",
+          "carrier_type": "Dual Belt Carriers",
+          "carrier_pitch": "600 mm",
+          "belt_size": "495 x 800 mm",
+          "operation": "As shipments pass through barcode scanning tunnel, barcodes are scanned and chutes are assigned. Carrier actuates to drop shipment in assigned chute."
+        },
+        "scanning_system": {
+          "type": "5 Side-Automatic Barcode Scanning & Dimensioning System",
+          "scanner_model": "ICR-890",
+          "make": "SICK",
+          "capabilities": ["Scan 1D codes", "Scan 2D codes", "Archive shipment images in real time"],
+          "note": "Scanning rate will be committed during DAP"
+        },
+        "output_chute": {
+          "description": "Output chute and its accessories in client scope",
+          "communication": "Profinet",
+          "signals": {
+            "beacon_light": "1 per 3 chutes",
+            "chute_full_sensors": "2 per chute",
+            "flap_actuation": "1 per chute"
+          }
+        },
+        "infrastructure": {
+          "mezzanine": "In client scope",
+          "maintenance_platform": "In client scope",
+          "staircase": "In client scope"
+        }
+      }
+    },
+    {
+      "example_id": 3,
+      "system_type": "Double Deck Loop Cross-Belt Sorter with Manual and Telescopic Infeed",
+      "process_flow": {
+        "manual_infeed_system": {
+          "description": "Shipments are placed in singulation on the infeed conveyor lines. These shipments are then transported upward via an inclined conveyor to auto induct line."
+        },
+        "infeed_from_telescopic_conveyors": {
+          "description": "Shipments are placed in singulation on the telescopic conveyor lines. These shipments are then transported upward via an inclined conveyor to auto induct line."
+        },
+        "auto_induct_line": {
+          "description": "Auto Induct line will induct the parcel automatically onto the sorter."
+        },
+        "loop_cbs": {
+          "description": "Cross-Belt Sorter efficiently sorts shipments into the appropriate output chutes using sorting logic.",
+          "type": "Loop CBS"
+        },
+        "scanning_and_dimensioning_system": {
+          "description": "5 Side scanning and Dimensioning system are planned on the Cross Belt Sorter system."
+        },
+        "chutes": {
+          "live_dock_chute": {
+            "description": "For direct loading to trucks"
+          },
+          "manual_chute": {
+            "description": "For manual collection"
+          },
+          "technical_chute": {
+            "description": "For rejected/technical shipments"
+          }
+        }
+      },
+      "system_description": {
+        "infeed_system": {
+          "manual_infeed_system": {
+            "infeed_points": 4,
+            "configuration": "2 for each deck",
+            "capacity": "Minimum 3000 parcels per hour",
+            "design_feature": "Allows shipment feeding from both sides while ensuring unobstructed pallet movement",
+            "straight_and_inclined_conveyor": {
+              "belt_width": "1200 mm",
+              "belt_material": "PVC",
+              "belt_thickness": "3 mm",
+              "load_capacity": "40 kg/m",
+              "motor_type": "AC Geared Motor",
+              "gear_motor_make": "SEW/Nord/Lenze",
+              "drive_make": "Lenze/Siemens/Omron/Allen Bradly/Similar",
+              "features": ["Low Noise", "Maximum uptime", "Minimal maintenance", "High safety standards", "Fastest ROI"]
+            },
+            "curve_conveyor": {
+              "description": "Robust and easily maintainable with uniquely designed curve and belts for smooth turns",
+              "features": ["Non-deformable metal frames", "Removable belt guide assembly parts"]
+            },
+            "buffer_conveyor": {
+              "description": "Temporarily stores parcels to manage flow when there is mismatch in speeds or capacities",
+              "usefulness": "Absorbs temporary surges or gaps in flow for smooth continuous process"
+            }
+          },
+          "infeed_with_telescopic_conveyors": {
+            "infeed_points": 4,
+            "configuration": "2 for each deck",
+            "capacity": "Minimum 3000 parcels per hour",
+            "tbc_configuration": "2 TBCs per deck with one dock left free between two TBCs",
+            "specifications": {
+              "manufacturer": "Falcon Autotech/Equivalent",
+              "parcel_size_min": "100x100x5 mm",
+              "parcel_size_max": "800x600x500 mm",
+              "parcel_weight_min": "0.05 kg",
+              "parcel_weight_max": "30 kg",
+              "base_length": "7500 mm",
+              "extended_length": "15300 mm",
+              "belt_speed": "18-30 m/min",
+              "load_capacity": "50 kg/m"
+            }
+          }
+        },
+        "auto_induct_feedline_system": {
+          "quantity": 4,
+          "configuration": "4 auto inducts per deck",
+          "ipp_per_induct": "3000 PPH",
+          "modules_per_induct": {
+            "spacing_conveyor": 3,
+            "weighing_conveyor": 1,
+            "receiving_conveyor": 1,
+            "short_buffer_conveyor": 8,
+            "angle_merge_conveyor": 2
+          },
+          "rejection_chute": {
+            "description": "Takes out oversized and overweight parcels to ground floor"
+          },
+          "spacing_conveyor": {
+            "description": "Variable speed module that creates space between parcels and regulates feeding on weighing conveyor",
+            "also_known_as": "Gapping conveyor or gap optimizer"
+          },
+          "weighing_conveyor": {
+            "description": "Measures weight of parcels as they move along belt",
+            "equipment": "High precision Load Cells",
+            "legal_for_trade": "Yes",
+            "make": "Bizerba/Mettler Toledo/Equivalent"
+          },
+          "receiving_conveyor": {
+            "description": "Receives and transfers products from infeed-line into processing line",
+            "also_known_as": "Inlet conveyor or intake conveyor"
+          },
+          "buffer_conveyors": {
+            "description": "Temporarily stores items to manage flow and maintain throughput"
+          },
+          "angle_merge_conveyor": {
+            "angle": "30°",
+            "type": "Triangular Dual Belt high-speed conveyor",
+            "belt_type": "Strip Belts"
+          },
+          "rejection_chute": {
+            "functionality": "Receiving conveyor runs in reverse for oversized/overweight shipments and drops them in rejection chute"
+          }
+        },
+        "loop_cross_belt_sorter": {
+          "configuration": "Double Deck",
+          "installation_level": "Ground level",
+          "lower_deck_height": "3800 mm from ground",
+          "upper_deck_height": "5800 mm from ground",
+          "carrier_type": "Dual Belt Carriers",
+          "carrier_pitch": "1175 mm",
+          "belt_size": "495 x 800 mm",
+          "operation": "Shipments pass through barcode scanning tunnel where barcodes are scanned and chutes assigned. Carrier actuates to drop shipment in assigned chute."
+        },
+        "scanning_system": {
+          "type": "5 Side-Automatic Barcode Scanning & Dimensioning System",
+          "scanner_type": "ICR (Image Code Reader)",
+          "make": "SICK/Cognex/Similar",
+          "barcode_types": ["1D", "2D"],
+          "module_size": ">=10 mils for 1D, >=25 mils for 2D",
+          "location": "5 sides excluding bottom",
+          "orientation": "Omnidirectional",
+          "capabilities": ["Scan barcodes", "Archive shipment images in real time"],
+          "specifications": {
+            "min_parcel_height_measurable": "20 mm",
+            "dimensional_accuracy": "+/- 10 mm on standard box",
+            "legal_for_trade": "Yes"
+          }
+        },
+        "output_chutes": {
+          "manual_chute": {
+            "type": "Double Decker Collection Type",
+            "quantity": 63,
+            "equipment_per_chute": {
+              "chute_full_sensor": 2,
+              "three_colors_beacon_light": 1
+            }
+          },
+          "live_dock_chute": {
+            "quantity": 22,
+            "description": "Directly load sorted parcels on telescopic belt conveyor for loose load in trucks",
+            "components": ["Spiral chute", "Telescopic conveyor", "Transfer chute"],
+            "equipment_per_chute": {
+              "chute_full_sensor": 2,
+              "beacon_light": 1
+            }
+          },
+          "technical_chute": {
+            "quantity": 6,
+            "description": "Manage rejected parcels, positioned in one zone for ease of operation",
+            "connection": "Connected with non-powered roller conveyor for accumulation and manual handling",
+            "equipment_per_chute": {
+              "chute_full_sensor": 2,
+              "three_colors_beacon_light": 1
+            }
+          }
+        },
+        "infrastructure": {
+          "protection_on_ground": {
+            "leg_guards": {
+              "quantity": 1500,
+              "material": "MS",
+              "design": "Falcon standard",
+              "location": "All legs coming near to pathway only"
+            }
+          },
+          "mezzanine_platform": {
+            "total_area": "1454 sq. meters",
+            "minimum_clear_height": "3000 mm",
+            "type": "Grating Type",
+            "stairs": 14
+          },
+          "pathways": {
+            "description": "Allocated pathways for operator and vehicle movement indicated in 3D drawings"
+          },
+          "system_color": {
+            "cable_tray": "Metallic Silver Grey (RAL 9006)",
+            "safety_part": "Flame red (RAL 3000)",
+            "leg_structure": "Agate Grey Wood (RAL 7038)",
+            "conveyor_feedline_sorter_chutes": "Traffic Yellow (RAL 1023)"
+          }
+        }
+      }
+    },
+    {
+      "example_id": 4,
+      "system_type": "Loop Cross-Belt Sorter with VDS and Bagging System",
+      "process_flow": {
+        "infeed_system": {
+          "description": "System consists of 5 infeed lines for Small and Big Parcels. Shipments will get loaded on their respective infeed lines and will move in the volume distribution loop (VDS)."
+        },
+        "vds_loop": {
+          "description": "Operators will pick the shipments from the volume distribution loop and load them on the auto-induct lines respectively."
+        },
+        "auto_induct": {
+          "description": "Operators will place the shipments on the loading conveyor with barcode facing the topside and then the shipments will get buffered and get intelligently merged on the cross-belt sorter loop."
+        },
+        "scanning_on_sorter": {
+          "description": "Once the shipments are on the cross-belt loop, they will pass through a tunnel where the barcodes of the shipments will get scanned from the topside and the volume of the shipments will be captured."
+        },
+        "sorting": {
+          "description": "Based on the information gathered for barcode and volume scanning, the shipments will get sorted in their respective collection chute or direct bagging chutes."
+        },
+        "bagging_system": {
+          "description": "The bags which are created at direct bagging chutes will be loaded on the bagging conveyor and will be transported to the bagging induct line where the operator will scan the barcodes on the bags and the bags will be autoloaded on the sorter."
+        },
+        "bag_sorting": {
+          "description": "Based on the information captured from the barcode scanning, the bags will get sorted into the large shipment chute."
+        },
+        "secondary_sorting": {
+          "description": "The operators standing near the collection chutes will pick the bags, scan their barcode once again from their handheld scanner and will place them on their respective pallets for dispatch."
+        }
+      },
+      "system_description": {
+        "infeed_system": {
+          "infeed_conveyors": {
+            "quantity": 5,
+            "description": "Operators will load the shipments and then the shipments will move towards the volume distribution loop"
+          },
+          "vds_loop_conveyor": {
+            "description": "Bulk materials enter the VDS Loop through infeed conveyors. The loop moves shipments in a loop for operators to pick and place them on induct lines"
+          },
+          "conveyor_boq_summary": {
+            "pvc_belt_conveyors": 17
+          }
+        },
+        "parcel_inducts": {
+          "quantity": 6,
+          "modules_per_feedline": {
+            "loading_conveyor": 1,
+            "buffer_conveyor": 1,
+            "intelligent_merge": 1
+          },
+          "loading_conveyor": {
+            "description": "Aligns and releases products for induction onto CBS. Initial point of entry where products are collected and conveyed"
+          },
+          "buffer_conveyors": {
+            "description": "Temporarily stores items to manage flow when there is mismatch in speeds or capacities",
+            "purpose": "Maintain throughput of line"
+          },
+          "intelligent_merge_conveyor": {
+            "angle": "30°",
+            "type": "Triangular high-speed conveyor",
+            "belt_type": "Strip Belts",
+            "description": "Incorporates advanced automation to intelligently merge multiple streams into single unified flow"
+          }
+        },
+        "bag_inducts": {
+          "quantity": 1,
+          "modules": 4,
+          "components": ["Loading conveyor", "30-degree belt turn", "Buffer conveyor", "Intelligent merge conveyor"],
+          "operation": "Operator standing near induct will scan barcode of bag received from bagging conveyor"
+        },
+        "main_loop": {
+          "installation_height": "1900 mm from ground level",
+          "carrier_type": "Dual Belt Carriers",
+          "carrier_pitch": "1175 mm",
+          "belt_size": "495 x 800 mm",
+          "operation": "Parcels pass through barcode scanning tunnel where barcodes and dimensions are scanned. Chutes are assigned based on barcode and dimension information. Carrier actuates to drop shipment in assigned chute."
+        },
+        "output_chutes": {
+          "direct_bagging_chute": {
+            "description": "Planned to sort small shipments directly into bags",
+            "equipment": {
+              "chute_full_sensor": 1,
+              "tower_lamp": 1,
+              "push_button": 1
+            }
+          },
+          "collection_chute": {
+            "quantity": 10,
+            "type": "Collection type",
+            "description": "For big shipments. Shipments get sorted inside collection trolleys from where operator picks shipments, scans barcode with HHT and places on respective pallets",
+            "note": "Collection trolleys in client scope"
+          }
+        },
+        "bagging_conveyor": {
+          "description": "System equipped with conveyors which help created bags from direct bagging chute to be conveyed to bag induct",
+          "conveyor_boq_summary": {
+            "pvc_belt_conveyors": 5,
+            "bagging_conveyors": 3,
+            "belt_turn_30_degree": 1
+          }
+        },
+        "secondary_sorting": {
+          "pallets": {
+            "description": "Big shipments/bags sorted in collection chutes picked by operators. Operators use hand-held terminal to scan barcodes",
+            "operation": "Hand-held terminal displays pallet position/number where shipment should be placed",
+            "note": "Pallets and hand-terminals in client scope"
+          }
+        },
+        "telescopic_belt_conveyor": {
+          "quantity": 6,
+          "type": "Standalone TBCs",
+          "purpose": "Loading of bags/shipments into container at outbound docks",
+          "specifications": {
+            "base_length": "4000 mm",
+            "extension": "12000 mm",
+            "total_length": "16000 mm",
+            "belt_width": "800 mm",
+            "height": "850 mm",
+            "belt_speed": "20-30 mpm"
+          }
+        },
+        "system_technical_details": {
+          "conveyor_system": {
+            "infeed_conveyors": "~112.6 meters (17 modules)",
+            "bagging_conveyor": "~51.1 meters (9 modules)",
+            "telescopic_belt_conveyor": "6 Nos"
+          },
+          "feedlines": {
+            "total": 7,
+            "parcel_induct": 6,
+            "bag_induct": 1
+          },
+          "sorter": {
+            "type": "Loop Cross Belt Sorter",
+            "quantity": 1,
+            "sorter_height": "1900 mm",
+            "sorter_length": "~99.3 m",
+            "sorter_speed": "~2 m/s",
+            "sorter_drive": "Linear Motor",
+            "carrier_pitch": "1175 mm"
+          }
+        }
+      }
+    }
+  ]
+}
