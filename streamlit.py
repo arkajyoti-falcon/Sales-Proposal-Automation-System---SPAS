@@ -1,24 +1,772 @@
+
 import os
+import io
 import streamlit as st
 import pandas as pd
 import json
 import re
+import base64
+import copy
+import tempfile
+import time
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime
+from typing import Optional
 from dataclasses import dataclass
 from typing import Dict, List
+from pathlib import Path
+from collections import Counter, defaultdict
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from docx.oxml import OxmlElement, parse_xml
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from PIL import Image
 from groq import Groq
 from dotenv import load_dotenv
+from docxcompose.composer import Composer
 import pdfplumber
+import ezdxf
+import requests
+import convertapi
 
 load_dotenv()
+
+# ==================== GROQ CLIENT SETUP ====================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+CONVERTAPI_SECRET = os.getenv("CONVERTAPI_SECRET")
+
+if not GROQ_API_KEY:
+    st.sidebar.error("⚠️ GROQ_API_KEY not found in .env file!")
+else:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+
+if CONVERTAPI_SECRET:
+    convertapi.api_credentials = CONVERTAPI_SECRET
+
+# ==================== CLIENT LOGOS MAPPING ====================
+CLIENT_LOGOS = {
+    "Zepto": "FIXED_IMAGE/clients/zepto.png",
+    "Flipkart": "FIXED_IMAGE/clients/flipkart.png",
+    "Shiprocket": "FIXED_IMAGE/clients/shiprocket.png",
+    "Amazon": "FIXED_IMAGE/clients/amazon.png",
+    "Delhivery": "FIXED_IMAGE/clients/delhivery.png",
+    "Swiggy": "FIXED_IMAGE/clients/swiggy.png",
+    "Mondial": "FIXED_IMAGE/clients/mondial.jpg",
+    "Zomato": "FIXED_IMAGE/clients/zomato.png",
+}
+
+# ==================== COMPONENT DESCRIPTION IMAGE PATHS ====================
+COMPONENT_IMAGES = {
+    "cross_belt_sorter": r"FIXED_IMAGE\CROS_BELT_SORTER.PNG",
+    "cbs_carrier": r"FIXED_IMAGE\CBS_CAREER.PNG",
+    "servo_roller": r"FIXED_IMAGE\SERVO_ROLLER.PNG",
+    "chassis": r"FIXED_IMAGE\CHASIS.PNG",
+    "wheel": r"FIXED_IMAGE\CAREER_WHEEL.PNG",
+    "power": r"FIXED_IMAGE\TRANSMISSION.PNG",
+    "linear": r"FIXED_IMAGE\LINEAR_MOTOR_DRIVE.PNG",
+    "friction_wheel": r"FIXED_IMAGE\FRICTION_WHEEL_DRIVE.PNG",
+    "rcoax": r"FIXED_IMAGE\DATA.PNG",
+    "carrier_position": r"FIXED_IMAGE\CPS.PNG",
+}
+
+# ==================== GLOSSARY MASTER LIST ====================
+GLOSSARY_ENTRIES = [
+    ("RFQ", "Request For Quotation"),
+    ("RFP", "Request For Proposal"),
+    ("PPH", "Parcels / Shipments Per Hour"),
+    ("ARB", "Actuated Roller Balls"),
+    ("DBO", "Damaged Barcode"),
+    ("VDS", "Volume Distribution System"),
+    ("ICR", "Intelligent Character Recognition"),
+    ("MEZZ", "Mezzanine"),
+    ("LIM", "Linear Induction Motor"),
+    ("LSM", "Linear Synchronous Motor"),
+    ("FWD", "Friction Wheel Drive"),
+    ("ECDS", "Empty Carrier Detection System"),
+    ("AC", "Alternating Current"),
+    ("DC", "Direct Current"),
+    ("PLC", "Programmable Logic Controller"),
+    ("IT", "Information Technology"),
+    ("BOQ", "Bill Of Quantity"),
+    ("I/O", "Input/ Output"),
+    ("PDP", "Power Distribution Panel"),
+    ("PC", "Personal Computer"),
+    ("UPS", "Uninterrupted Power Supply"),
+    ("CBS", "Cross Belt Sorter"),
+    ("MDR", "Motor Driven Roller"),
+    ("IPP", "Individual Productivity Potential"),
+    ("VM", "Virtual Machine"),
+    ("MENA", "Middle East North Africa"),
+    ("FOC", "Free of Cost"),
+    ("CEP", "Courier Express Parcel"),
+    ("DAP", "Design Approval Phase"),
+    ("DNF", "Data Not Found"),
+    ("LGM", "Logic Mismatch"),
+    ("RTVC", "Real Time Video Coding"),
+    ("NL Shipments", "Non-Large Shipments"),
+    ("SL Shipments", "Semi-Large Shipments"),
+    ("NO(S)", "Piece(s)"),
+]
+
+# ==================== RETRY WRAPPER FOR RATE LIMITS ====================
+def call_groq_with_retry(api_call_func, max_retries=5, initial_delay=2):
+    """Wrapper to retry GROQ API calls with exponential backoff on rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return api_call_func()
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a rate limit error
+            if "429" in error_str or "rate_limit_exceeded" in error_str.lower():
+                if attempt < max_retries - 1:
+                    # Extract wait time from error message if available
+                    wait_match = re.search(r'try again in ([0-9.]+)s', error_str)
+                    if wait_match:
+                        wait_time = float(wait_match.group(1)) + 1  # Add 1 second buffer
+                    else:
+                        wait_time = initial_delay * (2 ** attempt)  # Exponential backoff
+                    
+                    st.warning(f"Rate limit hit. Waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                else:
+                    raise  # Re-raise on final attempt
+            else:
+                raise  # Re-raise non-rate-limit errors immediately
+    
+    raise RuntimeError(f"Failed after {max_retries} retries")
+
+# ==================== GLOSSARY UTILITIES ====================
+
+def extract_full_text_from_docx(doc: Document) -> str:
+    """Concatenate all paragraph and table text from the DOCX."""
+    parts = []
+    for p in doc.paragraphs:
+        if p.text:
+            parts.append(p.text)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text:
+                    parts.append(cell.text)
+
+    return "\n".join(parts)
+
+
+def find_terms_in_text(text: str):
+    """
+    Return list of (term, description) that actually appear in the text.
+    Matching is done as a whole word, case-sensitive, to avoid accidental
+    matches of 'it' vs 'IT'.
+    """
+    found = []
+    for term, desc in GLOSSARY_ENTRIES:
+        # Build safe regex – whole word / token
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])"
+        if re.search(pattern, text):
+            found.append((term, desc))
+
+    # keep original order, no duplicates
+    seen = set()
+    unique = []
+    for t, d in found:
+        if t not in seen:
+            seen.add(t)
+            unique.append((t, d))
+    return unique
+
+# ==================== DXF COMPONENT EXTRACTION ====================
+
+UNITS = {
+    0: "Unitless", 1: "inches", 2: "feet", 3: "miles",
+    4: "millimeters", 5: "centimeters", 6: "meters", 7: "kilometers",
+}
+
+def _is_noise_block(name: str) -> bool:
+    """Filter out anonymous / noise blocks like *U69, *D123, etc."""
+    n = name.strip()
+    if re.match(r"^\*U\d+$", n, re.IGNORECASE): return True
+    if re.match(r"^\*D\d+$", n, re.IGNORECASE): return True
+    if n.startswith("*"): return True
+    return False
+
+def _normalize_group_name(name: str) -> str:
+    """Normalize raw block name to a group name."""
+    n = name.strip()
+    if "|" in n: n = n.split("|")[-1]
+    n = re.sub(r"[_\-]+", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    n = re.sub(r"\s*\(?\d+\)?$", "", n).strip()
+    return n.lower()
+
+def extract_dxf_components(dxf_path: Path) -> dict:
+    """Extract component names + counts from DXF file."""
+    doc = ezdxf.readfile(str(dxf_path))
+    msp = doc.modelspace()
+    hdr = doc.header
+    units_code = hdr.get("$INSUNITS", None)
+    try:
+        units_code = int(units_code) if units_code is not None else None
+    except: units_code = None
+    
+    extmin = hdr.get("$EXTMIN", None)
+    extmax = hdr.get("$EXTMAX", None)
+    raw_counts: Counter[str] = Counter()
+    
+    for e in msp:
+        try:
+            if e.dxftype() == "INSERT":
+                bname = e.dxf.name
+                if not _is_noise_block(bname):
+                    raw_counts[bname] += 1
+        except: continue
+    
+    group_map: dict[str, dict] = defaultdict(lambda: {"total_count": 0, "examples": Counter()})
+    for raw_name, cnt in raw_counts.items():
+        gname = _normalize_group_name(raw_name)
+        if not gname: continue
+        group_map[gname]["total_count"] += cnt
+        group_map[gname]["examples"][raw_name] += cnt
+    
+    groups = []
+    for gname, data in group_map.items():
+        ex_list = [{"name": n, "count": c} for n, c in data["examples"].most_common(5)]
+        groups.append({"group": gname, "total_count": int(data["total_count"]), "examples": ex_list})
+    groups.sort(key=lambda x: -x["total_count"])
+    
+    return {
+        "file": dxf_path.name,
+        "units_code": units_code,
+        "units_name": UNITS.get(units_code, "unknown") if units_code is not None else None,
+        "extents": {"min": list(extmin) if extmin else None, "max": list(extmax) if extmax else None},
+        "groups": groups,
+        "raw_block_counts": {k: int(v) for k, v in raw_counts.items()},
+    }
+
+def _summarise_components_for_prompt(dxf_json: dict) -> str:
+    groups = dxf_json.get("groups", [])
+    if not groups: return "No component groups detected."
+    lines = []
+    for g in groups[:40]:
+        name = g.get("group", "")
+        total = g.get("total_count", 0)
+        ex = g.get("examples", [])
+        top_example = ex[0]["name"] if ex else ""
+        lines.append(f"- {name} (count: {total}, example: {top_example})")
+    return "\n".join(lines)
+
+def convert_dxf_to_png(dxf_path: Path) -> Path:
+    """Convert DXF file to PNG using ConvertAPI."""
+    if not CONVERTAPI_SECRET:
+        raise RuntimeError(
+            "CONVERTAPI_SECRET is not set in .env file. Cannot convert DXF to PNG without it."
+        )
+    
+    try:
+        # Convert DXF to PNG using ConvertAPI
+        result = convertapi.convert("png", {"File": str(dxf_path)}, from_format="dxf")
+        out_files = result.save_files(str(dxf_path.parent))
+        
+        # Find the PNG file
+        for f in out_files:
+            if str(f).lower().endswith(".png"):
+                return Path(f)
+        
+        # Return first file if no .png extension found
+        return Path(out_files[0]) if out_files else None
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert DXF to PNG: {str(e)}")
+
+def _normalise_to_numbered_steps(raw_text: str) -> str:
+    """Force clean 1..N numbered list from GROQ output."""
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    if len(lines) == 1:
+        parts = re.split(r'(?:(?<=\.)\s+)(?=\d+\.)', lines[0])
+        lines = [p.strip() for p in parts if p.strip()]
+    
+    steps = []
+    for ln in lines:
+        m = re.match(r"^(\d+)[\.\)\-]\s*(.*)$", ln)
+        content = m.group(2).strip() if m else ln
+        if content: steps.append(content)
+    
+    dedup = []
+    seen = set()
+    for s in steps:
+        key = re.sub(r"\s+", " ", s.lower())
+        if key not in seen:
+            seen.add(key)
+            dedup.append(s)
+    
+    max_steps = min(len(dedup), 9) if len(dedup) >= 5 else len(dedup)
+    return "\n".join([f"{i}. {content}" for i, content in enumerate(dedup[:max_steps], start=1)])
+
+# ==================== LOOP CBS EXCEL PARSING ====================
+
+def load_loop_cbs_sheet_from_excel(xlsx_bytes: bytes) -> tuple[str | None, pd.DataFrame | None]:
+    """
+    Find sheet whose name is 'Loop CBS' or 'Loop CBS upper' (case/space-insensitive)
+    and return (sheet_name, DataFrame). Reads the FULL sheet (no cropping).
+    """
+    with pd.ExcelFile(io.BytesIO(xlsx_bytes)) as xls:
+        target_name = None
+        for sname in xls.sheet_names:
+            normalized = sname.lower().replace(" ", "")
+            if normalized == "loopcbs" or normalized == "loopcbsupper":
+                target_name = sname
+                break
+
+        if target_name is None:
+            return None, None
+
+        # Read entire sheet as generic table (no header), so we keep all rows/blocks.
+        df = xls.parse(target_name, header=None)
+        return target_name, df
+
+
+def df_to_compact_text(df: pd.DataFrame, max_rows: int = 200, max_cols: int = 20) -> str:
+    """
+    Convert the ENTIRE sheet (up to max_rows, max_cols) into a compact text representation
+    including BOTH tables in Loop CBS sheet.
+    """
+    if df is None:
+        return ""
+
+    df2 = df.iloc[:max_rows, :max_cols].fillna("")
+
+    lines: list[str] = []
+    for idx in range(df2.shape[0]):
+        row_vals = [str(v).strip() for v in df2.iloc[idx].tolist()]
+        # keep only non-empty cells in the print
+        row_vals = [v for v in row_vals if v != ""]
+        if row_vals:
+            lines.append(" | ".join(row_vals))
+
+    return "\n".join(lines)
+
+def df_to_compact_text_quote_master(df: pd.DataFrame) -> str:
+    """
+    Convert Quote Master dataframe to compact text for GROQ.
+    Every non-empty row becomes a pipe-separated list of "Col=Value".
+    """
+    lines = []
+    headers = list(df.columns)
+
+    for _, row in df.iterrows():
+        if row.isna().all():
+            continue
+
+        pairs = []
+        for h, v in zip(headers, row.values):
+            if pd.isna(v) or h is None:
+                continue
+            v_str = str(v).strip()
+            if not v_str:
+                continue
+            pairs.append(f"{h}={v_str}")
+
+        if pairs:
+            lines.append(" | ".join(pairs))
+
+    return "\n".join(lines)
+
+# ==================== PROCESS FLOW GENERATION ====================
+
+def call_groq_for_process_flow(client_name: str, project_name: str, dxf_json: dict):
+    """Call GROQ to generate Process Flow from DXF components."""
+    safe_dxf_json = {k: v for k, v in dxf_json.items() if k != "raw_block_counts"}
+    comp_summary = _summarise_components_for_prompt(safe_dxf_json)
+    print("comp_summary:", comp_summary)
+
+    system_prompt = """You are a senior solution engineer writing "Process Flow of the System" for CBS proposals.
+OUTPUT FORMAT: Numbered list (5-9 steps), each: "<number>. <Short Title>: <description>"
+RULES:
+- Base each step on DXF component groups
+- Use generic terms: infeed conveyors, cross-belt sorter, output chutes
+- Include counts where useful (e.g., "58 gravity chutes")
+- Follow physical flow: loading → induct → CBS → chutes/PTL
+- Engineering language, not marketing
+- No invented modules not in DXF"""
+
+    user_prompt = f"""Client: {client_name}
+Project: {project_name}
+
+DXF Components:
+{comp_summary}
+
+Write "Process Flow of the System" as 5-9 numbered steps based on these components."""
+
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="groq/compound",
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt.strip()},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+    
+    resp = call_groq_with_retry(api_call)
+    raw_text = resp.choices[0].message.content.strip()
+    clean_steps = _normalise_to_numbered_steps(raw_text)
+    return clean_steps, raw_text
+
+# ==================== MERMAID FLOWCHART GENERATION ====================
+
+def sanitize_mermaid_for_render(code: str) -> str:
+    """Minimal sanitization for Mermaid code."""
+    if not code: return code
+    code = code.strip()
+    if code.startswith("```"):
+        lines = code.split("\n")
+        if lines[0].strip().startswith("```"): lines = lines[1:]
+        if lines and lines[-1].strip() == "```": lines = lines[:-1]
+        code = "\n".join(lines).strip()
+    if code.lower().startswith("mermaid"): code = code[7:].strip()
+    if not code.lower().startswith("flowchart"): return code
+    return code.replace("\r\n", "\n").replace("\r", "\n")
+
+def generate_mermaid_png(mermaid_code: str) -> tuple:
+    """Render Mermaid diagram to PNG."""
+    logs = []
+    mermaid_str = sanitize_mermaid_for_render(mermaid_code)
+    logs.append(f"Cleaned Mermaid code:\n{mermaid_str}\n")
+    
+    # Strategy 1: Kroki PNG with JSON
+    try:
+        payload = {"diagram_source": mermaid_str, "diagram_type": "mermaid", "output_format": "png"}
+        resp = requests.post("https://kroki.io/mermaid/png", json=payload, 
+                           headers={"Content-Type": "application/json"}, timeout=30)
+        if resp.ok and resp.content and len(resp.content) > 100:
+            logs.append(f"✓ Kroki PNG returned {len(resp.content)} bytes.")
+            return resp.content, "\n".join(logs)
+    except Exception as e:
+        logs.append(f"Kroki PNG error: {repr(e)}")
+    
+    # Strategy 2: Mermaid.ink
+    try:
+        json_payload = {"code": mermaid_str, "mermaid": {"theme": "default"}}
+        b64_str = base64.b64encode(json.dumps(json_payload).encode('utf-8')).decode('ascii')
+        resp = requests.get(f"https://mermaid.ink/img/{b64_str}", timeout=30)
+        if resp.ok and resp.content and len(resp.content) > 100:
+            logs.append(f"✓ mermaid.ink returned {len(resp.content)} bytes.")
+            return resp.content, "\n".join(logs)
+    except Exception as e:
+        logs.append(f"mermaid.ink error: {repr(e)}")
+    
+    raise RuntimeError(f"Failed to render Mermaid:\n" + "\n".join(logs))
+
+def call_groq_for_mermaid(process_flow_text: str):
+    """Generate Mermaid flowchart code from process flow."""
+    system_prompt = """You are a diagram expert for Mermaid v11 flowcharts.
+RULES:
+- Start with: flowchart TD (top-down)
+- Simple IDs: A, B, C, D (no special chars)
+- Square brackets for labels: A[Start]
+- Short labels (2-5 words)
+- Use --> for arrows
+- Apply colors using classDef and :::className
+- Green (#90EE90) for input, Blue (#87CEEB) for process, Yellow (#FFE97F) for sorting, 
+  Orange (#FFB366) for collection, Red (#FFB3B3) for rejection
+- Output ONLY mermaid code, no backticks"""
+
+    user_prompt = f"""Convert to vertical Mermaid flowchart with colors:
+{process_flow_text}
+
+Use flowchart TD, simple node IDs (A,B,C), short labels, apply color coding with classDef."""
+
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="groq/compound",
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt.strip()},
+            ],
+            temperature=0.0,
+            max_tokens=2000,
+        )
+    
+    resp = call_groq_with_retry(api_call)
+    mermaid_code = resp.choices[0].message.content.strip()
+    mermaid_code = re.sub(r"^```(?:mermaid)?\s*", "", mermaid_code, flags=re.MULTILINE)
+    mermaid_code = re.sub(r"\s*```$", "", mermaid_code, flags=re.MULTILINE)
+    return mermaid_code.strip()
+
+# ==================== PROPOSED SYSTEM TECHNICAL DETAILS - BOM AGGREGATION ====================
+
+PROPOSED_SYSTEM_TECHNICAL_DETAILS_PROMPT = """
+You are a proposal BOM aggregation engine for Cross Belt Sorter projects.
+
+INPUT
+- You receive flattened rows from an Excel sheet called "Quote Master".
+- Each row looks like:
+  "S.No=1 | Category=Conveyor | Description=Straight PVC Conveyor BW 800 | UOM=m | Re=24 | ..."
+- Columns can include S.No., Category, Sub-Category, Description, UOM, Costing Type, Cost,
+  Unit Price, Sales Factor Requirement, Recommended Quantity, etc.
+
+GOAL
+- Build a SHORT "Proposed System Technical Details" section, split into 3 logical sub-sections:
+  1) "Mechanical equipment"
+  2) "Electrical Equipment"
+  3) "Control System"
+- The output must be highly aggregated, similar to Falcon proposal tables, NOT one row per part.
+
+GENERAL RULES
+- Strongly prefer 3–6 rows in Mechanical, 1 row in Electricals, 1 row in Control System.
+- Group fine-grained parts into functional systems.
+- DO NOT list every small item separately in the final table.
+- DO NOT invent components that are not present in the sheet.
+
+MECHANICAL EQUIPMENT – TYPICAL SYSTEMS
+Create a small number of "systems" such as (examples, use only what makes sense):
+- "Infeed System" or "Auto Infeed System"
+- "Feedlines" or "Auto Induct Feedlines"
+- "Sorter – 1 Loop Cross Belt Sorter"
+- "Sorter Outputs"
+- "Steel Works"
+- Any other clear mechanical system suggested by the data.
+
+Mapping guidance:
+- Infeed / Auto Infeed System:
+  - Straight PVC conveyors, S3 conveyors, gravity rollers, curves, merges, spacing conveyors that
+    clearly belong to the main inbound line.
+- Feedlines / Auto Induct Feedlines:
+  - Receiving, weighing, spacing, buffer conveyors, angle merges that feed the sorter.
+- Sorter:
+  - Loop CBS sorter, carrier pitch, sorter length/height/speed, type of drive (LIM/LSM),
+    supports, fencing, empty-carrier detection, product centring, dimension scanning, etc.
+- Sorter Outputs:
+  - PTL chutes, rejection chutes, spurs, pop-up sorter units, bag holding assemblies, bins, etc.
+- Steel Works:
+  - Platforms, mezzanines, stairs, ladders, fencing, safety guards, leg guards, end joints etc.
+
+ELECTRICAL EQUIPMENT
+- Usually a single line "Electricals – Consists of".
+- Group all power/controls items:
+  - main power distribution panel, MCC, main control panel, feedline control panels,
+    sorter drive panels, VFD panels, network switches, field cabling, earthing, hooters,
+    tower lamps, pull cords, emergency stops, IO cards, surge suppressors, harmonic filters, etc.
+- Quantity: typically "1 Set".
+- Value: usually just "Included" (unless there is a clear different summary).
+
+CONTROL SYSTEM
+- Usually a single line "Components – Consists of".
+- Group all PLC / SCADA / IT / software items:
+  - PLC based control system, SCADA, industrial switches, servers/IPC, CCTV/VMS,
+    OCR/vision PCs, WCS / sorter control software, PTL controllers, licences, custom IT integration, etc.
+- Quantity: typically "1 Set".
+- Value: use simple summary such as "1 Nos" and "As per requirement" where appropriate.
+
+DATA TO PRODUCE FOR EACH ROW
+For each final row in the tables, you must produce:
+- pos: integer, starting from 1 within each section.
+- qty: short human-readable quantity, e.g. "1 Set", "14 Feedlines", "1 Sorter".
+- description_lines: array of short text lines for the Description column:
+    * Line 1: main system name (e.g. "Infeed System" or "Sorter").
+    * Following lines: bullet-style sub points starting with "• ". These are
+      the key components grouped into this system.
+- value_lines: array of short text lines for the Value column. Use this for:
+    * Total counts or dimensions of important components.
+    * Example: "Straight PVC Conveyors: ~38 m total", "Curve Conveyors: 2 Nos".
+
+IMPORTANT: think in terms of systems, not raw rows.
+
+---------------- EXAMPLES (VERY IMPORTANT) ----------------
+
+Example A – Aggregating an Infeed System
+
+INPUT snippet (conceptual):
+ROW: Category=Conveyor | Description=Straight PVC Conveyor BW 800 | UOM=m | Re=24
+ROW: Category=Conveyor | Description=Straight PVC Conveyor BW 1000 | UOM=m | Re=14
+ROW: Category=Conveyor | Description=Curve Conveyor 30 deg | UOM=Nos | Re=2
+
+EXPECTED mechanical item:
+{
+  "pos": 1,
+  "qty": "1 Infeed System",
+  "description_lines": [
+    "Infeed System",
+    "• Straight PVC Conveyors",
+    "• Curve Conveyors"
+  ],
+  "value_lines": [
+    "Straight PVC Conveyors: ~38 m total",
+    "Curve Conveyors: 2 Nos"
+  ]
+}
+
+Example B – Aggregating Feedlines
+
+INPUT snippet (conceptual):
+Rows describing "Receiving Conveyor", "Weighing Conveyor", "Spacing Conveyor",
+"Buffer Conveyor", "Angle merge" with various quantities.
+
+EXPECTED mechanical item:
+{
+  "pos": 2,
+  "qty": "14 Feedlines",
+  "description_lines": [
+    "Feedlines – Consists of",
+    "• Receiving Conveyor",
+    "• Weighing Conveyor",
+    "• Spacing Conveyor",
+    "• Buffer Conveyor",
+    "• Angle merge"
+  ],
+  "value_lines": [
+    "Receiving Conveyor: 1 Set",
+    "Weighing Conveyor: 1 Set",
+    "Spacing Conveyor: 3 Set",
+    "Buffer Conveyor: 3 Set",
+    "Angle merge: 2 Set"
+  ]
+}
+
+Example C – Aggregating the Sorter
+
+INPUT snippet (conceptual):
+Rows describing a loop CBS sorter with height, length, speed, drive type,
+carrier pitch and associated mechanical options.
+
+EXPECTED mechanical item:
+{
+  "pos": 3,
+  "qty": "1 Sorter",
+  "description_lines": [
+    "Sorter",
+    "1 Loop Cross Belt Sorter",
+    "• Sorter height",
+    "• Sorter length",
+    "• Sorter speed",
+    "• Sorter drive",
+    "• Carrier pitch",
+    "Including:",
+    "• Standard sorter supports",
+    "• Product centring system",
+    "• Dimension / barcode scanning system",
+    "• Hooters and E-stops",
+    "• Fencing"
+  ],
+  "value_lines": [
+    "Height: approx 2900 mm",
+    "Loop length: approx 150 m"
+  ]
+}
+
+Example D – Electricals
+
+INPUT snippet (conceptual):
+Rows for power distribution panel, main control panel, feedline control panels,
+sorter drive panels, network switches, field cabling, hooters, tower lamps, etc.
+
+EXPECTED electrical section:
+{
+  "title": "Electrical Equipment",
+  "items": [
+    {
+      "pos": 1,
+      "qty": "1 Set",
+      "description_lines": [
+        "Electricals",
+        "Consists of",
+        "Main power distribution panel",
+        "Main control panel",
+        "Feedline control panels",
+        "Sorter drive panels",
+        "Network switches",
+        "Field cabling"
+      ],
+      "value_lines": [
+        "Included"
+      ]
+    }
+  ]
+}
+
+Example E – Control System
+
+INPUT snippet (conceptual):
+Rows for Siemens PLC, SCADA, industrial switches, servers, sorter control software.
+
+EXPECTED control section:
+{
+  "title": "Control System",
+  "items": [
+    {
+      "pos": 1,
+      "qty": "1 Set",
+      "description_lines": [
+        "Components",
+        "Consists of",
+        "PLC based control system with SCADA",
+        "Industrial switch"
+      ],
+      "value_lines": [
+        "1 Nos",
+        "As per requirement"
+      ]
+    }
+  ]
+}
+
+---------------- OUTPUT FORMAT ----------------
+
+Return JSON ONLY in this schema:
+
+{
+  "sections": [
+    {
+      "title": "Mechanical equipment",
+      "items": [
+        {
+          "pos": 1,
+          "qty": "1 Set",
+          "description_lines": ["..."],
+          "value_lines": ["..."]
+        }
+      ]
+    },
+    {
+      "title": "Electrical Equipment",
+      "items": [ ... ]
+    },
+    {
+      "title": "Control System",
+      "items": [ ... ]
+    }
+  ]
+}
+"""
+
+def call_groq_for_bom(sheet_text: str) -> dict:
+    """Call GROQ API to generate aggregated BOM structure from Quote Master sheet."""
+    user_prompt = (
+        "Below are flattened rows from the 'Quote Master' sheet.\n\n"
+        "QUOTE_MASTER_ROWS:\n"
+        + sheet_text
+    )
+
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": PROPOSED_SYSTEM_TECHNICAL_DETAILS_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+    try:
+        resp = call_groq_with_retry(api_call)
+        return json.loads(resp.choices[0].message.content)
+    except Exception as e:
+        st.error(f"Failed to generate Proposed System Technical Details: {e}")
+        return None
 
 # ==================== GROQ PROMPTS & CONSTANTS ====================
 
@@ -26,10 +774,10 @@ load_dotenv()
 COVER_LETTER_SYSTEM_PROMPT = """
 You are an AI assistant working as a professional proposal writer at Falcon Autotech. You are an expert in drafting formal, client-specific techno-commercial cover letters for proposals. Your role is to generate well-structured, personalized cover letters that follow Falcon's business communication style, maintain a professional and respectful tone, and clearly demonstrate Falcon's commitment, expertise, and partnership approach to clients.
 
-Generate a formal techno-commercial COVER LETTER for a proposal. 
+Generate a formal techno-commercial COVER LETTER for a proposal that MUST fit within a single page. 
 The writing style MUST be indistinguishable from natural human writing. The text should read as if drafted by an experienced professional, not an AI system. Use clear, simple, and natural language with varied sentence lengths and structures. Avoid generic phrases, repetitive patterns, or mechanical tone. Ensure that the output flows smoothly, conveys intent naturally, and would not be detected as machine-generated. The content should feel thoughtful, context-aware, and aligned with how a human proposal writer or business professional would communicate.
 
-MAX COVER LETTER WORDS : 250 WORDS OR 1500 CHARACTER (whatever is minimum)
+STRICT LENGTH LIMIT: Maximum 300 words to ensure single-page fit. Be concise and impactful.
 
 1. Start with:
    Kind Attention –
@@ -45,30 +793,37 @@ MAX COVER LETTER WORDS : 250 WORDS OR 1500 CHARACTER (whatever is minimum)
    If multiple executives, skip "Dear" and go directly to the content.
    Use Mr. for male and Ms. for female executives.
 
-3. Opening paragraph (human way):
-   - Acknowledge the invitation or requirement.
-   - If invitation_date exists, mention it naturally.
-   - If meeting_date exists, reference recent discussions or suggestions.
-   - Wording must change between runs (not fixed sentences).
+3. Opening paragraph (natural, professional style):
+   - Thank the client for inviting Falcon to offer for the project.
+   - If invitation_date or meeting_date exists, reference it naturally (e.g., "Over the past period we worked closely together" or "In our meeting on [date], we discussed...").
+   - Mention that you are pleased to submit the Techno-Commercial Offer.
+   - Wording must vary between runs (not fixed sentences).
 
-4. Body (human way):
-   - Highlight Falcon's analysis, solution evaluation, and technical proposal attachment.
-   - Mention Falcon's proven intralogistics technologies and experience.
-   - Personalize with client_name.
-   - Optionally mention project planning or timeline.
+4. Middle paragraph - System Overview & Analysis (CRITICAL):
+   - State that Falcon has done an in-depth data analysis and evaluated various solution options.
+   - **MANDATORY: Include the high-level process flow summary if provided**. Mention key system components naturally in a single sentence (e.g., "The proposed solution includes automatic induct conveyors, cross-belt sorter with scanner systems, and output chutes for efficient sortation").
+   - Highlight any specific technical values, quantities, or capacities if mentioned (e.g., "200 destinations", "5 camera scanner systems", "2 speed settings").
+   - Keep this brief but informative - demonstrate technical understanding without overwhelming detail.
+   - Mention that the detailed technical proposal is laid out in various sections to provide full insight into the proposed solution.
 
-5. Closing (human way):
-   - Reaffirm sender's personal commitment.
-   - Encourage the client to reach out for clarifications.
+5. Commitment paragraph:
+   - Reference Falcon's intralogistics automation technologies and proven track record.
+   - Highlight subsequent sections covering capabilities, experiences, and references.
+   - Reinforce commitment to being a strategic partner.
+
+6. Closing (professional, warm):
+   - Add sender's personal commitment on behalf of Falcon Autotech.
+   - Encourage client to reach out for clarifications or further information.
    - End with "Best Regards," followed by sender_name and sender_title.
 
 Important:
-- Do not exceed word/character limit.
+- MUST NOT EXCEED 300 words to ensure single-page fit.
 - Keep tone formal, professional, and client-oriented.
 - Do not copy exact sentences; rephrase wording across generations.
 - The cover letter MUST sound human, natural and professional. It should be clear, authentic, and warm, without feeling robotic or overly formal.
 - DO NOT ADD ANY EXTRA WORD OR INFO APART FROM THE COVER LETTER.
 - Highlight the main system or project name in main body (not subject line) as bold style, use ** for Bold.
+- If process_flow_summary is provided, ALWAYS incorporate it naturally into the letter.
 """
 
 COVER_LETTER_USER_PROMPT_TEMPLATE = """
@@ -85,8 +840,16 @@ executives (one per line, already with Mr./Ms. prefix):
 invitation_date: {invitation_date}
 meeting_date: {meeting_date}
 
+process_flow_summary (very high-level system components and key quantities): {process_flow_summary}
+
 sender_name: {sender_name}
 sender_title: {sender_title}
+
+CRITICAL REQUIREMENTS:
+1. The cover letter MUST fit within a single page (maximum 300 words).
+2. If process_flow_summary is provided, ALWAYS incorporate it naturally into the letter body to demonstrate technical understanding.
+3. Mention any specific quantities or technical details from the summary to add credibility.
+4. Keep the tone professional, warm, and client-focused like the example letter provided.
 
 Return ONLY the cover letter text, without markdown code fences or extra commentary.
 """
@@ -114,6 +877,7 @@ The summary must always reflect Falcon's style but **no two summaries should eve
 - The order of bullets should vary slightly between generations.  
 - Add numeric along with the components ONLY IF extensively mentioned in Proposed System Description
 - Bold the main components of the system. There can be max 2-3 bold words.
+- **CRITICAL: Always use numeric format for quantities (e.g., 3, 9, 24, 202) instead of words (e.g., three, nine, twenty-four).**
 
 **Closing Section**
 - End with a **personalized closing statement**.  
@@ -134,6 +898,232 @@ The summary must always reflect Falcon's style but **no two summaries should eve
 
 DO NOT ADD ANY EXTRA TEXT OR INFORMATION OR JUSTIFICATION or "Here is an Executive Summary for the proposal:" EXCEPT THE FULL PROPOSAL
 """
+
+# System Description System Prompt
+ENHANCED_SYSTEM_DESCRIPTION_PROMPT = """You are an expert Material Handling System Engineer specializing in Cross-Belt Sorter systems. Your task is to generate COMPREHENSIVE, DETAILED, and EXTENSIVE system descriptions that match the depth and technical detail of professional engineering documentation.
+
+**CRITICAL INSTRUCTIONS:**
+
+1. **USE ONLY PROVIDED INFORMATION:**
+   - Extract ALL information from the process flow input
+   - Extract ALL quantities and specifications from the DXF file information
+   - DO NOT use any values from training examples
+   - DO NOT assume or invent specifications
+
+2. **DXF FILE INTEGRATION:**
+   You will receive DXF file information in JSON format containing:
+   - File name and units
+   - Block counts for components (chutes, operators, leg guards, fencing, pallets, etc.)
+   - Groups with total counts
+   
+   **Use this DXF data to:**
+   - Extract exact quantities for chutes, operators, safety equipment
+   - Include specific counts in relevant sections
+   - Reference the DXF file as the source of layout information
+   - Add details about protection, fencing, and infrastructure based on block counts
+
+3. **SECTION GENERATION - BE EXTREMELY DETAILED:**
+
+   Create sections ONLY for components mentioned in process flow or DXF data. Each section must be COMPREHENSIVE with multiple paragraphs.
+
+   **INFEED SYSTEM** (if mentioned):
+   - Write 4-6 detailed paragraphs
+   - Describe the overall configuration and purpose
+   - Explain each conveyor type in detail (3-4 sentences each):
+     * **Straight Belt Conveyor**: Modular and robust design, used for smooth conveying of products over straight paths. MS profile is used to build conveyor frame. The conveyors are supplied with necessary supports and bolts to fix them to the supporting plane, as well as junction elements allowing easy and jam-free passage from one conveyor to another. Features include low noise, maximum uptime, minimal maintenance, high safety standards, and fastest ROI.
+     * **Inclined PVC Conveyor**: Used for smooth conveying of products over inclined and declined paths. Belt conveyors feature modular design with MS profile construction. Supplied with necessary supports, bolts, and junction elements for seamless integration.
+     * **Buffer Conveyor**: A buffer conveyor, also known as a buffering conveyor or accumulation conveyor, is a type of conveyor system used to temporarily store or hold items in a controlled manner. Its primary purpose is to manage the flow of items between different stages of a production or handling process when there is a mismatch in the speeds or capacities of the upstream and downstream equipment. These conveyors are required to maintain the throughput of the line.
+     * **Curve Conveyor**: Robust and easily maintainable design. The uniquely designed curves and belts provide smooth environment to parcels for making turns. The metal frames of the belts are not deformable to prevent belt misalignment. The belt guide assembly includes removable parts to allow quick replacement in case of damage.
+   - Mention flow path from loading to induct zone
+   - Include general specifications format: Belt material (PVC), load capacity, motor type (AC Geared Motor), gear motor makes, drive makes
+   - Reference total conveyor counts if available from DXF
+
+   **INDUCTION/FEEDLINE SYSTEM** (if mentioned):
+   - Write 5-8 detailed paragraphs
+   - Describe overall feedline configuration
+   - Detail each module type with 3-4 sentences:
+     * **Loading/Receiving Conveyor**: A receiving conveyor is a type of conveyor system used to receive and release the products for induction onto CBS. It serves as the connection point at turn point of entry where products are collected and conveyed to subsequent stages of the process. The receiving conveyor accurately positions parcels for smooth transfer to the main sorter.
+     * **Weighing Conveyor**: A weighing conveyor, also known as a weigh belt conveyor, is a type of conveyor system specifically designed to measure the weight of materials as they move along the conveyor belt. It combines the functions of conveying and weighing into a single integrated process. Weighing conveyors are equipped with high precision load cells to capture the weight of shipments. Makes include Bizerba, Mettler Toledo, or equivalent manufacturers.
+     * **Spacing Conveyor**: A spacing conveyor, also referred to as a gapping conveyor or gap optimizer, is a type of conveyor system used to create and maintain consistent gaps or spacing between items as they move along the conveyor line. Its primary purpose is to regulate the flow and spacing of products to ensure smooth operation and efficient downstream processes. This conveyor is a variable speed special purpose module that creates space between parcels as well as regulates feeding to downstream equipment.
+     * **Buffer Conveyors**: Used to temporarily store or hold items in controlled manner. Primary purpose is to manage flow of items between different stages when there is mismatch in speeds or capacities of upstream and downstream equipment. Required to maintain the throughput of line.
+     * **Angle Merge Conveyor**: An angle/intelligent merge conveyor incorporates advanced automation and control technologies to intelligently merge stream of materials into a single unified flow. It optimizes the merging process by dynamically adjusting the speed and position of items to ensure a smooth and efficient merge. This is typically a 30° triangular high-speed conveyor used for inducting shipments/boxes directly onto the sorter. The belts are strip belts for smooth shipment movement.
+   - Explain sensor placement and functionality
+   - Describe how parcels are prepared and positioned for sorter entry
+   - Include number of feedlines and capacity from process flow
+
+   **MANUAL INDUCT STATIONS** (if mentioned):
+   - Write 2-3 paragraphs
+   - Describe location (ground level, mezzanine)
+   - Explain operator workflow in detail
+   - Mention capacity and number of stations
+   - Include operator count from DXF data if available
+
+   **CROSS-BELT SORTER (Main Sorter)**:
+   - Write 4-6 detailed paragraphs
+   - Describe sorter type (Linear CBS or Loop CBS)
+   - Installation details: height from ground, location
+   - Carrier specifications: type (single/dual belt), pitch, belt dimensions
+   - For Linear: top running length, total length, number of carriers
+   - For Loop: loop circumference, deck configuration
+   - Operation description: How parcels pass through the sorter, barcode scanning process, chute assignment logic, carrier actuation mechanism, discharge process
+   - Explain the sorting sequence step by step
+
+   **BARCODE SCANNING & DIMENSIONING SYSTEM** (if mentioned):
+   - Write 3-4 paragraphs
+   - Scanner type and configuration (5-side, 6-side, top-only)
+   - Technology: ICR (Image Code Reader) or other
+   - Manufacturer and model information
+   - Capabilities: Barcode types (1D, 2D), scanning coverage, orientation
+   - Additional features: Image archiving, dimension measurement accuracy
+   - Integration with WCS and sorting logic
+
+   **OUTPUT CHUTES** - BE VERY DETAILED:
+   - **Use exact quantities from DXF data**
+   - Write 8-12 paragraphs total covering all chute types
+   
+   For each chute type present:
+   
+   **Collection Chutes / Manual Chutes**:
+   - Extract total count from DXF data (look for "chute", "Chute" in block counts)
+   - Write 3-4 paragraphs describing:
+     * Type: Friction roller chute or gravity chute design
+     * Purpose: A friction roller chute is a type of chute used for the smooth descent of materials or objects from an elevated position to a lower level. It utilizes its roller platform to gradually descend and collect the parcel at the end.
+     * Configuration: Single deck or double deck
+     * Capacity calculation with example dimensions
+     * Equipment per chute: Chute full sensors (quantity and function), three-color tower lights/beacon lights (to indicate chute status), push buttons (to start/stop sorting operations)
+   
+   **Live Chutes / Live Dock Chutes** (if mentioned):
+   - Write 2-3 paragraphs
+   - Describe: A live chute refers to a combination of collection chute, PVC belt conveyor, and TBC (if applicable), where the collection chute helps bringing down the sorted parcel and releases it to running conveyor for direct loading into trucks
+   - Configuration and integration with conveyors
+   
+   **Rejection/Technical Chutes** (if mentioned):
+   - Write 2-3 paragraphs
+   - Purpose: Handle rejected, oversized, overweight, no-read parcels
+   - Design and operation
+   - Equipment included
+   
+   **Direct Bagging Chutes** (if applicable):
+   - Write 2-3 paragraphs
+   - Purpose and operation
+   - Integration with bagging system
+
+   **RECIRCULATION & MANUAL REFEED LINE** (if mentioned):
+   - Write 3-4 paragraphs
+   - Recirculation line: Strategically designed at the end of the sorter system to manage parcels that encounter sorting failures. This automated line efficiently gathers and transports the sort-failed parcels, refeeding them back into the sorter system without requiring additional manual labor. The entire process is seamless, ensuring parcels are automatically re-fed into the sorting system.
+   - Manual refeed line: Integration for reintroduction of rejected parcels that have been manually reprocessed. This ensures that manually handled parcels are easily fed back into the sorter, maintaining operational flow and minimizing delays.
+
+   **BAGGING SYSTEM** (if applicable):
+   - Write 3-4 paragraphs
+   - Bagging conveyor configuration
+   - Flow from bagging chutes to bag induct
+   - Bag scanning and induction process
+
+   **SECONDARY SORTING / PALLETIZATION** (if applicable):
+   - Write 2-3 paragraphs
+   - Operator workflow with hand-held terminals
+   - Pallet positioning and dispatch
+   - Include pallet count from DXF data if available
+
+   **TELESCOPIC BELT CONVEYORS** (if applicable):
+   - Write 2-3 paragraphs
+   - Quantity and placement
+   - Technical specifications: base length, extended length, belt specifications
+   - Purpose and operation
+
+   **INFRASTRUCTURE & SUPPORT SYSTEMS**:
+   - Write 6-10 paragraphs covering all infrastructure elements
+   
+   **Mezzanine Platform** (if mentioned):
+   - Total area, clear height, type
+   - Number of staircases
+   - Deck configuration
+   
+   **Safety & Protection**:
+   - **Extract counts from DXF data**:
+     * Leg guards count (look for "leg guard", "Leg Guard" in blocks)
+     * Operator safety guards (look for "operator safety" in blocks)
+     * Fencing (look for "fencing", "Fencing" in blocks)
+   - Write detailed paragraphs: Leg guards are protective components designed to shield the legs from external material or component. Material for leg guards is typically MS (Mild Steel). Operator safety guards protect personnel near the system. Perimeter fencing defines the loading zone and protects personnel.
+   
+   **Pathways**:
+   - Allocated pathways for operator and vehicle movement
+   
+   **System Color Coding** (if applicable):
+   - RAL color codes for different system components
+   
+   **Electrical & Controls Infrastructure**:
+   - Control panels, switch racks, socket provisions
+   - Cable management systems
+   - Communication protocols
+
+   **SYSTEM TECHNICAL SUMMARY**:
+   - Write 3-4 paragraphs summarizing:
+     * Total conveyor system metrics
+     * Feedline configuration and capacity
+     * Sorter specifications
+     * Total chutes by type (use DXF counts)
+     * Operator positions (from DXF)
+     * Infrastructure elements
+     * Key equipment and technologies
+
+4. **TABLE FORMATTING (CRITICAL):**
+   - When you need to present tabular data (e.g., system components, quantities, specifications), use this JSON format:
+   
+   ```json
+   TABLE_START
+   {
+     "title": "Table Title Here",
+     "headers": ["Column1", "Column2", "Column3"],
+     "rows": [
+       ["Row1Col1", "Row1Col2", "Row1Col3"],
+       ["Row2Col1", "Row2Col2", "Row2Col3"]
+     ]
+   }
+   TABLE_END
+   ```
+   
+   - Place this JSON block on its own lines in the output
+   - Do NOT use markdown tables (| --- |), ONLY use the JSON format above
+   - Use tables for: System Components, Quantities from DXF, Specifications, Equipment Lists
+
+5. **WRITING REQUIREMENTS:**
+   - Each major section: 4-8 paragraphs minimum
+   - Each subsection: 2-4 paragraphs minimum
+   - Each component description: 3-5 sentences minimum
+   - Use technical, professional language
+   - Explain functionality, purpose, and integration
+   - Include design rationale where applicable
+   - Maintain consistent technical depth throughout
+   - Use proper material handling terminology
+   - For bold text, use **text** format (it will be rendered bold without asterisks)
+   - **CRITICAL: Always use numeric format for quantities (e.g., 3, 9, 24, 202) instead of words (e.g., three, nine, twenty-four).**
+   - For subsection headings, use the format: ## Heading Text (this will be rendered as numbered subheading)
+   - Do NOT use bullet-star combinations like •	*Heading** for subsections, ONLY use ## format
+
+6. **QUANTITY EXTRACTION FROM DXF:**
+   - Total chutes: Sum all chute-related blocks
+   - Operators: Look for "operator", "Operator" in block names
+   - Leg guards: Look for "leg guard", "Leg Guard"
+   - Fencing: Look for "fencing", "Fencing"
+   - Pallets: Look for "pallet", "Pallet"
+   - Safety equipment: Look for "safety", "gaurd", "guard"
+   - Use these exact numbers in relevant sections
+
+7. **OUTPUT LENGTH TARGET:**
+   - Aim for 3000-5000 words total
+   - Match the depth and detail of professional engineering system descriptions
+   - Every component gets thorough explanation
+   - Multiple paragraphs per major section
+
+**REMEMBER:**
+- Be EXTREMELY detailed and comprehensive
+- Write multiple paragraphs for each section
+- Use exact quantities from DXF data
+- Explain every component thoroughly
+- Match the professional engineering documentation style
+- Generate content that is 5-10 pages when exported to Word
+- Use JSON format for ALL tables (TABLE_START...TABLE_END)"""
 
 # Config paths
 STATIC_ABOUT_DIR = r"Static_AboutCompany"
@@ -211,43 +1201,202 @@ st.set_page_config(page_title="Falcon Proposal Generator", page_icon="📄", lay
 # Custom CSS for professional look
 st.markdown("""
 <style>
+    /* Global Styles */
+    .main > div { 
+        padding-top: 2rem; 
+        padding-bottom: 2rem; 
+    }
+    
+    /* Main Header */
     .main-header {
+        background: linear-gradient(90deg, #060c71 0%, #2a3bb8 35%, #f9d20e 100%);
+        padding: 2rem;
+        border-radius: 15px;
+        margin-bottom: 2rem;
+        box-shadow: 0 8px 32px rgba(6, 12, 113, 0.3);
+        color: white;
+    }
+    
+    .main-header h1 {
+        color: #fff !important;
         font-size: 2.5rem;
         font-weight: 700;
-        color: #1f3864;
-        text-align: center;
-        margin-bottom: 0.5rem;
+        margin: 0;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.25);
     }
-    .sub-header {
+    
+    .main-header .subtitle {
+        color: rgba(255,255,255,0.95);
         font-size: 1.1rem;
-        color: #666;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .section-header {
-        font-size: 1.3rem;
-        font-weight: 600;
-        color: #1f3864;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-        border-bottom: 2px solid #1f3864;
-        padding-bottom: 0.5rem;
-    }
-    .stTextInput > label, .stFileUploader > label, .stTextArea > label, .stDateInput > label, .stCheckbox > label, .stSelectbox > label {
+        margin-top: 0.5rem;
         font-weight: 500;
-        color: #333;
+        text-shadow: 1px 1px 2px rgba(0,0,0,0.2);
     }
+    
+    /* Section Headers */
+    .section-header {
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        border-left: 4px solid #060c71;
+        padding: 1rem 1.5rem;
+        border-radius: 8px;
+        margin: 2rem 0 1rem 0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
+    
+    .section-header h3 {
+        color: #060c71;
+        font-weight: 700;
+        margin: 0;
+        font-size: 1.3rem;
+    }
+    
+    /* Input Fields */
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea,
+    .stDateInput > div > div > input,
+    .stSelectbox > div > div > select {
+        border-radius: 8px;
+        border: 2px solid #e0e0e0;
+        padding: 0.75rem;
+        font-size: 16px;
+        transition: all 0.3s ease;
+    }
+    
+    .stTextInput > div > div > input:focus,
+    .stTextArea > div > div > textarea:focus,
+    .stDateInput > div > div > input:focus,
+    .stSelectbox > div > div > select:focus {
+        border-color: #060c71;
+        box-shadow: 0 0 0 3px rgba(6, 12, 113, 0.1);
+    }
+    
+    /* Labels */
+    .stTextInput > label,
+    .stFileUploader > label,
+    .stTextArea > label,
+    .stDateInput > label,
+    .stCheckbox > label,
+    .stSelectbox > label {
+        font-weight: 600;
+        color: #2a3bb8;
+        font-size: 0.95rem;
+    }
+    
+    /* File Uploader */
+    .stFileUploader > div {
+        border: 2px dashed #060c71;
+        border-radius: 10px;
+        padding: 1.5rem;
+        text-align: center;
+        background: rgba(6,12,113,0.02);
+        transition: all 0.3s ease;
+    }
+    
+    .stFileUploader > div:hover {
+        background: rgba(6, 12, 113, 0.05);
+        border-color: #f9d20e;
+    }
+    
+    /* Buttons */
+    .stButton > button {
+        background: linear-gradient(135deg, #060c71 0%, #2a3bb8 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 0.75rem 2rem;
+        font-size: 16px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(6,12,113,0.3);
+        width: 100%;
+    }
+    
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #f9d20e 0%, #ffe34a 100%);
+        color: #060c71;
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(249,210,14,0.4);
+    }
+    
+    .stButton > button:disabled {
+        background: #cccccc;
+        color: #666666;
+        transform: none;
+        box-shadow: none;
+    }
+    
+    /* Download Button */
+    .stDownloadButton > button {
+        background: linear-gradient(135deg, #28a745 0%, #34ce57 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 0.75rem 2rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        width: 100%;
+        box-shadow: 0 4px 15px rgba(40,167,69,0.3);
+    }
+    
+    .stDownloadButton > button:hover {
+        background: linear-gradient(135deg, #218838 0%, #28a745 100%);
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(40,167,69,0.4);
+    }
+    
+    /* Expanders */
+    .streamlit-expanderHeader {
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        border-radius: 10px;
+        border: 2px solid #e0e0e0;
+        font-weight: 600;
+        color: #060c71;
+        padding: 1rem;
+    }
+    
+    .streamlit-expanderContent {
+        border: 2px solid #e0e0e0;
+        border-top: none;
+        border-radius: 0 0 10px 10px;
+        background: white;
+        padding: 1rem;
+    }
+    
+    /* Info Boxes */
     .info-box {
-        background-color: #f0f2f6;
-        border-left: 4px solid #1f3864;
+        background: linear-gradient(135deg, rgba(6,12,113,0.05) 0%, rgba(42,59,184,0.05) 100%);
+        border-left: 4px solid #060c71;
         padding: 1rem;
         margin: 1rem 0;
+        border-radius: 8px;
     }
+    
+    /* Success/Warning/Error Messages */
+    .stSuccess, .stWarning, .stError, .stInfo {
+        border-radius: 10px;
+        padding: 1rem;
+    }
+    
+    /* Divider */
+    hr {
+        margin: 2rem 0;
+        border: none;
+        height: 2px;
+        background: linear-gradient(90deg, transparent 0%, #f9d20e 50%, transparent 100%);
+    }
+    
+    /* Hide Streamlit Branding */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    .stDeployButton {display: none;}
 </style>
 """, unsafe_allow_html=True)
-
-st.markdown('<div class="main-header">Falcon Proposal Generator</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Professional Proposal Document Generation System</div>', unsafe_allow_html=True)
+st.markdown('''
+<div class="main-header">
+    <h1>Falcon Proposal Generator</h1>
+    <div class="subtitle">Professional Proposal Document Generation System</div>
+</div>
+''', unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -255,7 +1404,12 @@ st.markdown("---")
 
 # Deep Blue-Gray color for headings (RGB: 31, 56, 100)
 HEADING_COLOR = RGBColor(31, 56, 100)
-
+def render_section_header(title):
+    st.markdown(f'''
+    <div class="section-header">
+        <h3>{title}</h3>
+    </div>
+    ''', unsafe_allow_html=True)
 def apply_heading_style(paragraph, text, level=1):
     """Apply custom heading style: Calibri Headings 14pt, Bold, Underline, Numbered, Deep Blue-Gray"""
     paragraph.text = ""
@@ -304,7 +1458,16 @@ def apply_normal_style(paragraph, text=""):
 
 def apply_table_style(table):
     """Apply Medium Shading 1 Accent 1 style to table"""
-    table.style = 'Medium Shading 1 Accent 1'
+    try:
+        table.style = 'Medium Shading 1 Accent 1'
+    except KeyError:
+        # If style doesn't exist, apply manual formatting similar to Medium Shading 1 Accent 1
+        # This happens when document is created from a template without this style
+        try:
+            table.style = 'Table Grid'
+        except KeyError:
+            # If even Table Grid doesn't exist, skip styling
+            pass
     return table
 
 def add_centered_image(doc, path, width_in=5.5):
@@ -362,6 +1525,71 @@ def add_numbered_subheading(doc, text, counter=None):
     p.paragraph_format.space_after = Pt(3)
     
     return p
+
+def ensure_list_styles(doc):
+    """Ensure List Bullet, List Number, and Table styles exist in the document"""
+    styles = doc.styles
+    
+    # Check if List Bullet exists, if not create it
+    try:
+        styles['List Bullet']
+    except KeyError:
+        # Create List Bullet style
+        from docx.enum.style import WD_STYLE_TYPE
+        list_bullet_style = styles.add_style('List Bullet', WD_STYLE_TYPE.PARAGRAPH)
+        list_bullet_style.base_style = styles['Normal']
+        list_bullet_style.font.name = 'Calibri'
+        list_bullet_style.font.size = Pt(11)
+        # Set paragraph format for bullet
+        pf = list_bullet_style.paragraph_format
+        pf.left_indent = Inches(0.25)
+        pf.first_line_indent = Inches(-0.25)
+    
+    # Check if List Number exists, if not create it
+    try:
+        styles['List Number']
+    except KeyError:
+        # Create List Number style
+        from docx.enum.style import WD_STYLE_TYPE
+        list_number_style = styles.add_style('List Number', WD_STYLE_TYPE.PARAGRAPH)
+        list_number_style.base_style = styles['Normal']
+        list_number_style.font.name = 'Calibri'
+        list_number_style.font.size = Pt(11)
+        # Set paragraph format for numbering
+        pf = list_number_style.paragraph_format
+        pf.left_indent = Inches(0.25)
+        pf.first_line_indent = Inches(-0.25)
+    
+    # Check if List Number 2 exists, if not create it
+    try:
+        styles['List Number 2']
+    except KeyError:
+        # Create List Number 2 style (deeper indentation level)
+        from docx.enum.style import WD_STYLE_TYPE
+        list_number_2_style = styles.add_style('List Number 2', WD_STYLE_TYPE.PARAGRAPH)
+        list_number_2_style.base_style = styles['Normal']
+        list_number_2_style.font.name = 'Calibri'
+        list_number_2_style.font.size = Pt(11)
+        # Set paragraph format for second level numbering
+        pf2 = list_number_2_style.paragraph_format
+        pf2.left_indent = Inches(0.5)
+        pf2.first_line_indent = Inches(-0.25)
+    
+    # Check if Table Grid exists (basic table style)
+    try:
+        styles['Table Grid']
+    except KeyError:
+        # Create basic Table Grid style
+        from docx.enum.style import WD_STYLE_TYPE
+        try:
+            table_grid_style = styles.add_style('Table Grid', WD_STYLE_TYPE.TABLE)
+            table_grid_style.font.name = 'Calibri'
+            table_grid_style.font.size = Pt(11)
+        except:
+            pass  # If we can't create table style, it's okay
+    
+    # Note: We don't create 'Medium Shading 1 Accent 1' as it's complex
+    # The apply_table_style function will handle its absence gracefully
 
 def create_header_footer(doc, client_name, project_name, falcon_logo_path, client_logo_path):
     """Create header and footer for the document"""
@@ -526,6 +1754,101 @@ def add_hyperlink(paragraph, url, text):
 
     return hyperlink
 
+def create_cover_page(
+    client_logo: Optional[bytes],
+    client_name: str,
+    project_title: str,
+) -> io.BytesIO:
+    """Create a cover page using template - exactly as in main.py"""
+    template_path = "FIXED_IMAGE\\Cover_Temp.docx"
+    doc = Document(template_path)
+
+    # Remove all headers and footers from template
+    for sec in doc.sections:
+        for part in (
+            getattr(sec, "header", None),
+            getattr(sec, "footer", None),
+            getattr(sec, "first_page_header", None),
+            getattr(sec, "first_page_footer", None),
+            getattr(sec, "even_page_header", None),
+            getattr(sec, "even_page_footer", None),
+        ):
+            if not part:
+                continue
+            try:
+                part.is_linked_to_previous = False
+            except Exception:
+                pass
+            try:
+                for tbl in list(part.tables):
+                    tbl._element.getparent().remove(tbl._element)
+                for p in list(part.paragraphs):
+                    p._element.getparent().remove(p._element)
+            except Exception:
+                pass
+
+    # Add client logo if provided - process with PIL to ensure proper embedding
+    if client_logo:
+        try:
+            # Open and process image
+            im = Image.open(io.BytesIO(client_logo))
+            if im.mode != "RGBA":
+                im = im.convert("RGBA")
+            alpha = im.getchannel("A")
+            bbox = alpha.getbbox()
+            if bbox:
+                im = im.crop(bbox)
+                alpha = im.getchannel("A")
+            # Create white background and paste
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=alpha)
+
+            # Save to buffer
+            buf = io.BytesIO()
+            bg.save(buf, format="PNG")
+            buf.seek(0)
+
+            # Insert at beginning
+            first_para = doc.paragraphs[0]
+            run_logo = first_para.insert_paragraph_before().add_run()
+            run_logo.add_picture(buf, width=Inches(2.0))
+        except Exception:
+            # Fallback: insert without processing
+            first_para = doc.paragraphs[0]
+            run_logo = first_para.insert_paragraph_before().add_run()
+            run_logo.add_picture(io.BytesIO(client_logo), width=Inches(2.0))
+
+    # Add spacing
+    for _ in range(6):
+        doc.add_paragraph("")
+
+    # Add title
+    title = f"FALCON's Proposal to {client_name} for the {project_title}"
+    p = doc.add_paragraph()
+    run = p.add_run(title)
+    run.font.size = Pt(24)
+    run.font.bold = False
+    run.font.name = "Calibri"
+    run.font.color.rgb = RGBColor(255, 255, 255)
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # Add date
+    today_str = datetime.today().strftime("%B %d, %Y")
+    p2 = doc.add_paragraph()
+    run2 = p2.add_run(today_str)
+    run2.font.size = Pt(14)
+    run2.font.name = "Calibri"
+    run2.font.color.rgb = RGBColor(255, 215, 0)
+    p2.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # Add page break after cover page
+    doc.add_page_break()
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
 # ==================== ADDITIONAL HELPER FUNCTIONS ====================
 
 def extract_pdf_text(uploaded_file) -> str:
@@ -636,6 +1959,7 @@ def call_groq_cover_letter(
     meeting_date: str,
     sender_name: str,
     sender_title: str,
+    process_flow_summary: str = "",
 ) -> str:
     """Call Groq API to generate the cover letter text."""
     user_prompt = COVER_LETTER_USER_PROMPT_TEMPLATE.format(
@@ -646,20 +1970,23 @@ def call_groq_cover_letter(
         executives_block=executives_block.strip() or "Not provided",
         invitation_date=invitation_date.strip() or "Not provided",
         meeting_date=meeting_date.strip() or "Not provided",
+        process_flow_summary=process_flow_summary.strip() or "Not provided",
         sender_name=sender_name,
         sender_title=sender_title,
     )
 
-    completion = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": COVER_LETTER_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=800,
-    )
-
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="groq/compound",
+            messages=[
+                {"role": "system", "content": COVER_LETTER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=600,  # Increased to allow for process flow details while staying under 300 words
+        )
+    
+    completion = call_groq_with_retry(api_call)
     text = completion.choices[0].message.content.strip()
     if text.startswith("```"):
         parts = text.split("```")
@@ -678,22 +2005,70 @@ def call_groq_exec_summary(system_text: str, client_name: str, project_title: st
         "Generate the Executive Summary strictly as per the instructions."
     )
 
-    resp = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        temperature=0.4,
-        max_tokens=800,
-        messages=[
-            {"role": "system", "content": EXEC_SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="groq/compound",
+            temperature=0.4,
+            max_tokens=800,
+            messages=[
+                {"role": "system", "content": EXEC_SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        )
+    
+    resp = call_groq_with_retry(api_call)
+    return resp.choices[0].message.content.strip()
 
+def call_groq_for_system_description(process_flow: str, dxf_json: dict, project_name: str) -> str:
+    """Generate comprehensive system description using Groq API"""
+    # Convert DXF JSON to string for prompt
+    dxf_info = json.dumps(dxf_json, indent=2, ensure_ascii=False)
+    
+    user_prompt = f"""Generate a COMPREHENSIVE, DETAILED system description for:
+
+PROJECT NAME: {project_name}
+
+PROCESS FLOW:
+{process_flow}
+
+DXF FILE INFORMATION:
+{dxf_info}
+
+REQUIREMENTS:
+1. Extract ALL quantities from the DXF data (chutes, operators, leg guards, fencing, pallets)
+2. Use these exact numbers in the appropriate sections
+3. Generate EXTENSIVE descriptions for each component (multiple paragraphs), Add Table if needed.
+4. Only include sections for components mentioned in process flow or present in DXF data
+5. Write 2000-3000 words with technical depth matching professional engineering documentation
+6. Each major section should have 3-4 paragraphs with subsections having 2-4 paragraphs
+7. Each component description should have 3-5 sentences explaining functionality, design, and purpose
+8. Each subheading will be in bold format example: **Conveyor System**
+9. Do NOT ADD ```json`` or any other code block formatting in the output
+
+Generate the detailed system description now."""
+
+    def api_call():
+        return groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": ENHANCED_SYSTEM_DESCRIPTION_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=3000,
+            top_p=0.9
+        )
+    
+    resp = call_groq_with_retry(api_call)
     return resp.choices[0].message.content.strip()
 
 # ==================== COMMERCIAL/GROQ FUNCTIONS ====================
-
-# Groq client for price sheet generation
-groq_client = Groq.getenv("GROQ_API_KEY")
 
 GROQ_SYSTEM_PROMPT = """
 You are a senior commercial analyst for warehouse automation projects.
@@ -846,15 +2221,17 @@ def call_groq_for_price_sheet(sheet_csv: str) -> dict:
     """Call Groq API to extract price sheet from costing CSV"""
     user_prompt = GROQ_USER_PROMPT_TEMPLATE.format(sheet_csv=sheet_csv)
 
-    completion = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
-    )
-
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="groq/compound",
+            messages=[
+                {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+        )
+    
+    completion = call_groq_with_retry(api_call)
     raw = completion.choices[0].message.content.strip()
 
     # Strip markdown fences if present
@@ -955,198 +2332,483 @@ def apply_bca_discount_to_price_data(price_data: dict, discount_percent: float) 
     else:
         return formatted_number
 
+# ==================== CAPACITY CALCULATIONS FUNCTIONS ====================
+
+def build_capacity_prompt_from_excel(
+    excel_bytes: bytes,
+    client_name: str,
+    project_name: str
+) -> str:
+    """
+    Read the uploaded Excel (all sheets), dump them as CSV text,
+    and build a very explicit extraction prompt for GROQ.
+    We do NOT try to interpret any cell ourselves.
+    """
+    xls = pd.ExcelFile(BytesIO(excel_bytes))
+
+    sheet_dumps = []
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, header=None)
+        # Keep as CSV-like text to preserve structure
+        csv_text = df.to_csv(index=False, header=False)
+        sheet_dumps.append(f"### Sheet: {sheet}\n{csv_text}")
+
+    workbook_text = "\n\n".join(sheet_dumps)
+
+    # IMPORTANT: we define a strict JSON schema and explicitly
+    # tell GROQ to set fields to null if they are missing.
+    prompt = f"""
+You are an expert in interpreting throughput and capacity calculation Excel sheets
+for parcel/shipment sortation systems (Loop CBS, Linear CBS, Cross Belt Sorters, etc.).
+
+You are given a raw text dump of the complete Excel workbook used for capacity calculations.
+Using ONLY the information present in the workbook (numbers and labels), you must extract
+or compute the key capacity fields and return them as a single JSON object.
+
+Context:
+- Client: {client_name}
+- Project: {project_name}
+
+The workbook text follows after this instruction. It is a concatenation of all sheets, each
+in CSV-like form.
+
+IMPORTANT RULES:
+
+1. **Use exact numbers from the workbook wherever a field is explicitly present.**
+   - If a value is written in the sheet (e.g. "Sorter Speed 2 m/s", "Carrier per hour 6128"),
+     prefer the sheet value instead of recomputing it.
+2. **Only compute** a value if:
+   - It is clearly implied (e.g. carrier_per_hour = speed_mps * 3600 / pitch_m) AND
+   - It is NOT already available as a direct cell value.
+3. If a field is not given and cannot be safely derived, set it explicitly to null.
+
+KEY FIELDS (SEMANTICS):
+
+- sorter_type:
+    A short human-readable description like "Loop CBS", "Linear CBS", "Dual Belt Loop CBS"
+    or "Cross Belt Sorter". Use what best matches the workbook text.
+
+- sorter_speed_mps:
+    Sorter speed in meters per second. If sheet says "Speed 2 m/s", set 2.0.
+
+- pitch_m:
+    Carrier pitch in meters. If sheet says "Pitch 1,175 mm", then pitch_m = 1.175.
+
+- carriers_per_hour_cph:
+    "Carrier per hour" / "Carriers/Hour" / "Carriers per hour" from the sheet.
+    If not present, you may compute as:
+      carriers_per_hour = speed_mps * 3600 / pitch_m
+    and round to nearest integer.
+
+- belts_per_hour_bph:
+    "Belts per hour" / "Belts/Hour" from the sheet.
+    If not present but the sorter is clearly Dual Belt, you may compute:
+      belts_per_hour = carriers_per_hour * 2
+    If single belt, belts_per_hour = carriers_per_hour.
+
+- num_feedlines:
+    Number of feedlines / inducts / infeed lines (e.g. "No of Feedlines", "No of Inducts").
+    If the workbook has multiple such numbers, choose the one used in the capacity section.
+
+- num_operators:
+    Number of operators used in capacity calculations, if explicitly given
+    (e.g. "No of Operators", "No of operators on manual induct station").
+    If not given, set null.
+
+- capacity_per_operator_pph:
+    Capacity per operator in parcels/shipments per hour, if explicitly given
+    (e.g. "Capacity per operator 1000 Shipments per hour"). If not given, set null.
+
+- sorter_designed_capacity_A_pph:
+    Sorter designed capacity on the parcel spectrum. Look for labels like:
+    "Sorter Designed Capacity (A)", "Effective Designed Throughput of Sorter (A)",
+    "Effective Designed TPH", or similar. Use the PPH/Shipments per hour value.
+
+- feedline_designed_capacity_B_pph:
+    Total feedline/induction capacity. Look for labels like:
+    "Total Feedline designed capacity (B)", "Induction Capacity (B)",
+    "Total Induction Capacity Designed", etc. Use the PPH value.
+
+- effective_capacity_min_AB_pph:
+    The effective designed capacity of the system.
+    If the sheet already has "System designed throughput" or "Operational capacity",
+    use that value.
+    If not explicitly given, compute:
+       effective_capacity_min_AB_pph = min(sorter_designed_capacity_A_pph,
+                                           feedline_designed_capacity_B_pph)
+    (if both are known).
+
+- single_belt_pct and dual_belt_pct:
+    Percentages of shipments handled on single and dual belts, if present
+    (e.g. "Single Belts Shipments 91.36%", "Dual Belt Shipments 8.64%").
+    Store them as numeric percentages (e.g. 91.36, 8.64).
+    If not present, set them to null.
+
+JSON SCHEMA (MANDATORY KEYS):
+
+You MUST return exactly one JSON object with ALL of these keys:
+
+{{{{
+  "sorter_type": "Loop CBS or Linear CBS or Cross Belt Sorter etc.",
+  "sorter_speed_mps": 2.0,
+  "pitch_m": 1.175,
+  "carriers_per_hour_cph": 0,
+  "belts_per_hour_bph": 0,
+  "num_feedlines": 0,
+  "num_operators": null,
+  "capacity_per_operator_pph": null,
+  "sorter_designed_capacity_A_pph": 0,
+  "feedline_designed_capacity_B_pph": 0,
+  "effective_capacity_min_AB_pph": 0,
+  "single_belt_pct": null,
+  "dual_belt_pct": null
+}}}}
+
+RESPONSE FORMAT REQUIREMENTS (CRITICAL):
+
+- Output MUST be **only** a JSON object.
+- Do NOT include markdown, explanations, or any text outside the JSON.
+- All numeric values must be raw numbers (no units, no commas, no % signs).
+- If a value is unknown or not present, set it to null (not 0).
+- DO NOT add ```json``` or json in the response. ONLY return raw JSON.
+
+Below is the full workbook dump:
+
+{workbook_text}
+"""
+    return prompt
+
+
+def call_groq_for_capacity(prompt: str) -> dict:
+    """
+    Call GROQ with response_format=json_object so that we reliably get JSON.
+    """
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set in environment variables.")
+
+    client = Groq(api_key=GROQ_API_KEY)
+
+    def api_call():
+        return client.chat.completions.create(
+            model="groq/compound",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a precise JSON data extractor. Always follow the schema exactly."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+    
+    chat_completion = call_groq_with_retry(api_call)
+    raw = chat_completion.choices[0].message.content
+    return json.loads(raw)
+
+
+def call_groq_for_sorter_spec(sheet_name: str, sheet_text: str) -> dict:
+    """
+    Call GROQ API to extract sorter technical specifications from Loop CBS Excel sheet.
+    Returns a JSON object with sorter specifications.
+    """
+    system_prompt = """You are a technical proposal engineer reading an Excel costing/configuration sheet
+for a Loop Cross Belt Sorter ("Loop CBS").
+
+You will receive:
+- The sheet name (e.g., "Loop CBS")
+- The ENTIRE sheet content as text, row by row, including ALL tables.
+
+Your task:
+Extract the following fields, strictly from the sheet content:
+
+1) sorter_carrier_type        – fixed string "Loop CBS".
+2) sorter_speed_mps           – fixed string "upto 2 m/s"
+3) sorter_loop_length_m       – sorter loop length in meters (e.g., "150").
+4) sorter_height_mm           – sorter height in mm (e.g., "2900").
+5) actuation_technology       – fixed string "Electric".
+6) carrier_pitch_mm           – carrier pitch in mm (e.g., "600", "1175", "1200"). If multiple models,
+                                choose the one actually selected in the configuration area.
+7) number_of_carriers         – total number of carriers in the sorter, as shown in the sheet if present.
+8) motor_drive_type           – description of motor/drive type (e.g., "LIM", "LSM", "LIM + LSM", etc.).
+9) power_consumption          – sorter power consumption (kW or kVA etc.) taken from the sheet.
+
+VERY IMPORTANT RULES:
+- Use ONLY information present in the provided sheet text. Do NOT guess or invent values.
+- If a value is not clearly present, set it to null.
+- If the sheet expresses a choice ("Select Model", "Enter Loop Length", etc.), use the chosen values.
+- Keep the output values SHORT: just the numeric value or the short phrase, without explanations.
+
+Return a single JSON object with EXACTLY these keys:
+
+{
+  "sorter_carrier_type": "...",
+  "sorter_speed_mps": "... or null",
+  "sorter_loop_length_m": "... or null",
+  "sorter_height_mm": "... or null",
+  "actuation_technology": "...",
+  "carrier_pitch_mm": "... or null",
+  "number_of_carriers": "... or null",
+  "motor_drive_type": "... or null",
+  "power_consumption": "... or null"
+}
+
+No comments, no trailing text, no markdown."""
+
+    user_payload = {
+        "sheet_name": sheet_name,
+        "sheet_text": sheet_text,
+    }
+
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": json.dumps(user_payload, indent=2)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+
+    try:
+        resp = call_groq_with_retry(api_call)
+        text = resp.choices[0].message.content.strip()
+        spec = json.loads(text)
+        
+        if not isinstance(spec, dict):
+            raise ValueError("Expected a JSON object")
+        
+        # Fill fixed fields if missing
+        if not spec.get("sorter_carrier_type"):
+            spec["sorter_carrier_type"] = "Loop CBS"
+        if not spec.get("actuation_technology"):
+            spec["actuation_technology"] = "Electric"
+        
+        return spec
+    except Exception as exc:
+        st.error(f"Failed to parse GROQ response for sorter specification: {exc}")
+        return None
+
+
+def add_capacity_section_to_doc(
+    doc: Document,
+    client_name: str,
+    project_name: str,
+    cap: dict,
+    counter: int
+) -> None:
+    """
+    Add 'Sorter System Capacity' section to an existing Document,
+    using the extracted capacity dict.
+    """
+    # Heading
+    add_numbered_heading(doc, "Sorter System Capacity", counter=counter)
+
+    intro_para = (
+        f"The following table shows the throughput calculation for the sortation system "
+        f"designed based on {client_name}'s {project_name} requirements."
+    )
+    p = doc.add_paragraph(intro_para)
+    apply_normal_style(p)
+
+    # Table: SPECIFICATION | VALUE
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Medium Shading 1 Accent 1"
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "SPECIFICATION"
+    hdr[1].text = "VALUE"
+
+    def fmt(value, suffix=""):
+        if value is None or value == "":
+            return "N/A"
+        return f"{value}{suffix}"
+
+    def add_row(label, value):
+        row = table.add_row().cells
+        row[0].text = label
+        row[1].text = value
+
+    # Fill rows
+    add_row("Sorter Type", cap.get("sorter_type", ""))
+
+    # Speed / pitch
+    add_row("Sorter Speed", fmt(cap.get("sorter_speed_mps"), " m/s"))
+    add_row("Pitch", fmt(cap.get("pitch_m"), " m"))
+
+    # Capacity raw
+    add_row("Carrier per hour", fmt(cap.get("carriers_per_hour_cph"), " CPH"))
+    add_row("Belts per hour", fmt(cap.get("belts_per_hour_bph"), " BPH"))
+
+    # Feedlines / operators
+    add_row("No. of Feedlines", fmt(cap.get("num_feedlines")))
+    add_row("No. of Operators", fmt(cap.get("num_operators")))
+    add_row("Capacity per Operator", fmt(cap.get("capacity_per_operator_pph"), " PPH"))
+
+    # Sorter vs Feedline capacity
+    add_row(
+        "Sorter Designed Capacity (A)",
+        fmt(cap.get("sorter_designed_capacity_A_pph"), " PPH"),
+    )
+    add_row(
+        "Feedline Designed Capacity (B)",
+        fmt(cap.get("feedline_designed_capacity_B_pph"), " PPH"),
+    )
+    add_row(
+        "Effective Designed Capacity (min of A & B)",
+        fmt(cap.get("effective_capacity_min_AB_pph"), " PPH"),
+    )
+
+    # Optional single / dual belt %
+    if cap.get("single_belt_pct") is not None or cap.get("dual_belt_pct") is not None:
+        add_row(
+            "Single Belt Shipments",
+            fmt(cap.get("single_belt_pct"), " %"),
+        )
+        add_row(
+            "Dual Belt Shipments",
+            fmt(cap.get("dual_belt_pct"), " %"),
+        )
+
 # ==================== INPUT COLLECTION ====================
 
 # Professional Tabs for Input Organization
-tab1, tab2, tab3, tab4 = st.tabs(["Basic Information", "Cover Letter & Front Page", "Document Sections", "Commercial & Warranty"])
+# ==================== INPUT COLLECTION ====================
 
-# TAB 1: Basic Information
-with tab1:
-    st.subheader("Project Details")
-    col1, col2 = st.columns(2)
-    with col1:
-        client_name = st.text_input("Client Name", value="Zepto", placeholder="Enter client name")
-        project_name = st.text_input("Project Name", value="Automated Sorting System", placeholder="Enter project name")
-    with col2:
-        client_logo = st.file_uploader("Client Logo", type=["png", "jpg", "jpeg"])
+# Section 1: Project & Client Information
+render_section_header("Section 1: Project & Client Information")
 
-# TAB 2: Cover Letter & Front Page
-with tab2:
-    st.subheader("Cover Letter Information")
-    col1, col2 = st.columns(2)
-    with col1:
-        offer_ref = st.text_input("Offer Reference", value="F24-00524", placeholder="e.g., F24-00524")
-        letter_date = st.date_input("Letter Date", value=date.today())
-        invitation_date_str = st.text_input("Invitation Date (optional)", value="", placeholder="If received formal invitation")
-    with col2:
-        meeting_date_str = st.text_input("Meeting / Workshop Date(s) (optional)", value="", placeholder="Reference to recent meetings")
-        sender_name = st.text_input("Sender Name", value="Sandeep Bansal", placeholder="Person signing the letter")
-        sender_title = st.text_input("Sender Title", value="Chief Business Officer", placeholder="Sender's designation")
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    project_name = st.text_input("Project Name *", value="Automated Sorting System", placeholder="Enter project name")
+    offer_ref = st.text_input("Offer Reference No *", value="F24-00524", placeholder="e.g., F24-00524")
+    
+    # Client dropdown with add new option
+    client_options = list(CLIENT_LOGOS.keys()) + ["+ Add New Client"]
+    selected_client = st.selectbox("Client Name *", client_options, index=0)
+    
+    # Handle new client addition
+    if selected_client == "+ Add New Client":
+        client_name = st.text_input("Enter New Client Name *", placeholder="Enter client name")
+        client_logo = st.file_uploader("Upload Client Logo *", type=["png", "jpg", "jpeg"], key="new_client_logo")
+        client_logo_path_display = None
+    else:
+        client_name = selected_client
+        client_logo = None
+        client_logo_path_display = CLIENT_LOGOS.get(selected_client)
     
     executives_text = st.text_area(
-        "Executives (one per line, include Mr./Ms.)",
+        "Client Executives (one per line, include Mr./Ms.) *",
         value="Mr. Rahul Didwani\nMr. Vinayak Garg",
         height=80,
-        placeholder="List all executives to address"
+        placeholder="Mr. John Doe\nMs. Jane Smith"
     )
     
-    st.divider()
-    st.subheader("Front Page Details")
-    col3, col4 = st.columns(2)
-    with col3:
-        contact_name = st.text_input("Contact Person Name", value="Sanyog Pratap Singh")
-        contact_phone = st.text_input("Contact Phone", value="+91 8750052591")
-    with col4:
-        contact_email = st.text_input("Contact Email", value="Sanyog.Singh@falconautotech.com")
-        layout_image = st.file_uploader("Layout Image (for front page)", type=["png", "jpg", "jpeg"])
+    col1a, col1b = st.columns(2)
+    with col1a:
+        invitation_date = st.date_input("Invitation Date (optional)", value=None)
+    with col1b:
+        meeting_date = st.date_input("Meeting/Workshop Date (optional)", value=None)
+    
+    st.markdown("**Contact Person Details**")
+    col1c, col1d = st.columns(2)
+    with col1c:
+        contact_name = st.text_input("Name *", value="Sanyog Pratap Singh")
+        contact_phone = st.text_input("Phone *", value="+91 8750052591")
+    with col1d:
+        contact_email = st.text_input("Email *", value="Sanyog.Singh@falconautotech.com")
+        st.write("")  # Spacer
 
-# TAB 3: Document Sections
-with tab3:
-    st.subheader("Select Sections to Include")
-    
-    # Executive Summary
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.write("**Executive Summary**")
-        exec_summary_pdf = st.file_uploader("Upload Proposed System Description (PDF)", type=["pdf"], key="exec_summary_pdf_upload")
-    with col2:
-        st.write("‎")  # Spacer
-        include_exec_summary = st.checkbox("Include", value=True, key="exec_summary_check")
-    
-    st.divider()
-    
-    # Company Profile
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.write("**Company Profile**")
-        st.caption("Uses static content and images from Static_AboutCompany folder")
-    with col2:
-        st.write("‎")
-        include_company_profile = st.checkbox("Include", value=True, key="company_profile_check")
-    
-    st.divider()
-    
-    # Reference Projects
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.write("**Reference Projects**")
-        st.caption("Includes 5 reference projects with site pictures")
-    with col2:
-        st.write("‎")
-        include_ref_projects = st.checkbox("Include", value=True, key="ref_projects_check")
-    
-    st.divider()
-    
-    # Handled Shipment Spectrum
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.write("**Handled Shipment Spectrum**")
-        st.caption("Auto-selects template based on project name (Linear/Loop/Heavy-duty CBS)")
-    with col2:
-        st.write("‎")
-        include_handled_spectrum = st.checkbox("Include", value=True, key="handled_spectrum_check")
+with col2:
+    st.markdown("**Client Logo Preview**")
+    if client_logo_path_display and os.path.exists(client_logo_path_display):
+        st.image(client_logo_path_display, use_container_width=True)
+    elif client_logo:
+        st.image(client_logo, use_container_width=True)
+    else:
+        st.info("Logo will appear here")
 
-    # Capacity Calculations Section
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.write("**Sorter System Capacity Calculations**")
-        capacity_excel = st.file_uploader("Upload Capacity Excel (for Sorter System Capacity section)", type=["xlsx", "xls"], key="capacity_excel_upload")
-    with col2:
-        st.write("‎")
-        include_capacity_section = st.checkbox("Include", value=True, key="capacity_section_check")
+# Fixed values (not shown to user)
+letter_date = date.today()
+sender_name = "Sandeep Bansal"
+sender_title = "Chief Business Officer"
+invitation_date_str = invitation_date.strftime("%B %d, %Y") if invitation_date else ""
+meeting_date_str = meeting_date.strftime("%B %d, %Y") if meeting_date else ""
 
-    st.divider()
-    
-    # Technical Sections in Grid
-    st.subheader("Technical Sections")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        elec_include = st.checkbox("Electrical System", value=True, key="elec_check")
-        wcs_include = st.checkbox("Falcon WCS CONTROLIT", value=True, key="wcs_check")
-        scada_include = st.checkbox("Falcon Visual Inspection System (SCADA)", value=True, key="scada_check")
-        safety_include = st.checkbox("Principal of Safety", value=True, key="safety_check")
-        infra_include = st.checkbox("Infrastructure", value=True, key="infra_check")
-        client_resp_include = st.checkbox("Client Responsibility", value=True, key="client_check")
-    
-    with col2:
-        key_include = st.checkbox("Key Components Make", value=True, key="key_check")
-        prog_include = st.checkbox("Program Organisation", value=True, key="prog_check")
-        handover_include = st.checkbox("System Handover", value=True, key="handover_check")
-        commercial_include = st.checkbox("Commercial", value=True, key="commercial_check")
-        warranty_include = st.checkbox("Warranty Period", value=True, key="warranty_check")
-        exclusion_include = st.checkbox("Exclusions", value=True, key="exclusion_check")
-    
-    st.divider()
-    
-    # Key Components Editor (if selected)
-    if key_include:
-        with st.expander("Edit Key Components List"):
-            default_components = [
-                {"Items": "Belts", "Make": "Forbo / Derco / Habasit"},
-                {"Items": "Rollers", "Make": "Falcon"},
-                {"Items": "Cross Belt Carriers", "Make": "Falcon"},
-                {"Items": "Linear Motors (LIM / LSM / Linear Induction)", "Make": "Falcon / SEW / FWD (as applicable)"},
-                {"Items": "Feed Line Motors", "Make": "Falcon"},
-                {"Items": "Volume / Barcode Scanners", "Make": "SICK / Cognex / Similar"},
-                {"Items": "Weighing Scales", "Make": "Bizerba / Mettler Toledo / Equivalent"},
-                {"Items": "Encoders", "Make": "SICK / Falcon"},
-                {"Items": "Sensors", "Make": "SICK / Leuze / P&F"},
-                {"Items": "PLC", "Make": "Siemens / Omron"},
-                {"Items": "Control Panels", "Make": "Rittal / BCH"},
-                {"Items": "VFDs", "Make": "Siemens / Lenze / AB / Omron"},
-                {"Items": "Cables", "Make": "LAPP / Equivalent"},
-                {"Items": "Switch Gear", "Make": "Schneider / Equivalent"},
-                {"Items": "Bearings", "Make": "NTN / SKF / Equivalent"},
-                {"Items": "Power Transmission Systems", "Make": "Vahle"},
-                {"Items": "HMIs", "Make": "Siemens / Omron"},
-                {"Items": "MDR", "Make": "Pulse / Itoh Denki"},
-                {"Items": "Data Transmission System", "Make": "Siemens"},
-            ]
-            
-            if "key_components_df" not in st.session_state:
-                st.session_state["key_components_df"] = pd.DataFrame(default_components)
-            
-            key_components_edited = st.data_editor(
-                st.session_state["key_components_df"],
-                num_rows="dynamic",
-                width='stretch',
-                key="key_editor"
-            )
-    
-    # Program Organisation Gantt (if selected)
-    if prog_include:
-        with st.expander("Upload Gantt Chart"):
-            prog_gantt = st.file_uploader("Gantt Chart (optional)", type=["png", "jpg", "jpeg"], key="prog_gantt")
+st.markdown("---")
 
-# TAB 4: Commercial & Warranty
-with tab4:
-    st.subheader("Commercial Details")
-    costing_file = st.file_uploader("Upload Costing Excel File", type=["xlsx", "xls"], help="Excel file with 'Overall Costing' sheet")
+# Section 2: Upload Files
+render_section_header("Section 2: Upload Files")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    dxf_layout_file = st.file_uploader("2.1 DXF Layout File *", type=["dxf"], key="dxf_upload")
+    costing_file = st.file_uploader("2.2 Costing Sheet *", type=["xlsx", "xls"], key="costing_upload")
+
+with col2:
+    capacity_excel = st.file_uploader("2.3 Throughput Calculation Sheet *", type=["xlsx", "xls"], key="capacity_upload")
+    prog_gantt = st.file_uploader("2.4 Project Timeline Chart (optional)", type=["png", "jpg", "jpeg"], key="gantt_upload")
+
+st.markdown("")  # Spacer
+have_solution_png = st.checkbox("I already have PNG of the solution", value=False)
+
+if have_solution_png:
+    layout_full_png = st.file_uploader("Upload your solution PNG here", type=["png", "jpg", "jpeg"], key="solution_png_upload")
+else:
+    layout_full_png = None
+
+# All standard sections are included by default (not shown to user)
+include_exec_summary = True
+include_company_profile = True
+include_ref_projects = True
+include_handled_spectrum = True
+include_proposed_system = True
+include_concept_desc = True
+include_capacity_section = True
+elec_include = True
+wcs_include = True
+scada_include = True
+key_include = True
+safety_include = True
+infra_include = True
+prog_include = True
+client_resp_include = True
+handover_include = True
+commercial_include = True
+warranty_include = True
+exclusion_include = True
+
+st.markdown("---")
+
+# Section 3: Edit/Confirm Settings
+render_section_header("Section 3: Edit/Confirm Settings")
+
+with st.expander("💰 Commercial Settings", expanded=False):
+    apply_bca = st.checkbox("Apply Business Cooperation Agreement Discount (4.5%)", value=False, key="apply_bca_discount")
     
-    if costing_file:
-        st.success("Costing file uploaded successfully")
-        
-        apply_bca = st.checkbox("Apply Business Cooperation Agreement Discount (4.5% on Total)", value=False, key="apply_bca_discount")
-        
-        st.write("**Payment Terms (editable):**")
-        default_payment_terms = [
-            {"Payment Percentage": "20%", "Stage": "Advance along with LOI/ PO"},
-            {"Payment Percentage": "20%", "Stage": "After DAP Completion"},
-            {"Payment Percentage": "40%", "Stage": "Before Dispatch"},
-            {"Payment Percentage": "10%", "Stage": "Against Installation"},
-            {"Payment Percentage": "10%", "Stage": "Against Handover"},
-        ]
-        
-        if "payment_terms" not in st.session_state:
-            st.session_state["payment_terms"] = default_payment_terms
-        
-        pt_df = pd.DataFrame(st.session_state["payment_terms"])
-        edited_pt_df = st.data_editor(pt_df, num_rows="dynamic", width='stretch', key="payment_terms_editor")
-        st.session_state["payment_terms"] = edited_pt_df.to_dict(orient="records")
-    st.divider()
-    st.subheader("Warranty Configuration")
+    st.markdown("**Payment Terms**")
+    default_payment_terms = [
+        {"Payment Percentage": "20%", "Stage": "Advance along with LOI/ PO"},
+        {"Payment Percentage": "20%", "Stage": "After DAP Completion"},
+        {"Payment Percentage": "40%", "Stage": "Before Dispatch"},
+        {"Payment Percentage": "10%", "Stage": "Against Installation"},
+        {"Payment Percentage": "10%", "Stage": "Against Handover"},
+    ]
     
+    if "payment_terms" not in st.session_state:
+        st.session_state["payment_terms"] = default_payment_terms
+    
+    pt_df = pd.DataFrame(st.session_state["payment_terms"])
+    edited_pt_df = st.data_editor(pt_df, num_rows="dynamic", use_container_width=True, key="payment_terms_editor")
+    st.session_state["payment_terms"] = edited_pt_df.to_dict(orient="records")
+
+with st.expander("📜 Warranty Configuration", expanded=False):
     warranty_type = st.selectbox("Warranty Type", ["Standard warranty", "Comprehensive warranty"], key="warranty_type")
     
     col1, col2 = st.columns(2)
@@ -1169,35 +2831,33 @@ with tab4:
     if warranty_extended:
         warranty_extended_text = st.text_input(
             "Extended Warranty Text",
-            value="Post completion of the warranty period, the customer can opt for an Extended Warranty.",
+            value="Extended warranty of 2 years available on request @ 5% of the order value.",
             key="warranty_extended_text"
         )
     else:
-        warranty_extended_text = ""
+        warranty_extended_text = None
     
     warranty_amc = st.checkbox("Include AMC / Hotline Clause", value=False, key="warranty_amc")
     if warranty_amc:
         warranty_amc_text = st.text_input(
-            "AMC Text",
-            value="After the warranty year, an additional 2 years are covered under AMC and 24x7 Hotline support.",
+            "AMC / Hotline Text",
+            value="AMC / Hotline services available post warranty on demand.",
             key="warranty_amc_text"
         )
     else:
-        warranty_amc_text = ""
+        warranty_amc_text = None
     
     warranty_transport = st.checkbox("Include Transportation Note", value=False, key="warranty_transport")
     if warranty_transport:
-        warranty_transport_text = st.text_area(
+        warranty_transport_text = st.text_input(
             "Transportation Note",
-            value="Note: Transportation cost for sending faulty items to Falcon factory from the site will be in the customer's scope.",
+            value="Transportation of defective parts to Falcon premises will be at client's cost.",
             key="warranty_transport_text"
         )
     else:
-        warranty_transport_text = ""
-    
-    st.divider()
-    st.subheader("Exclusions Configuration")
-    
+        warranty_transport_text = None
+
+with st.expander("🚫 Exclusions Configuration", expanded=False):
     st.write("**Select Exclusions to Include:**")
     
     variable_exclusions = [
@@ -1229,9 +2889,42 @@ with tab4:
     selected_exclusions = []
     cols = st.columns(2)
     for idx, item in enumerate(variable_exclusions):
-        with cols[idx % 2]:
-            if st.checkbox(item, key=f"excl_{idx}"):
-                selected_exclusions.append(item)
+        col = cols[idx % 2]
+        if col.checkbox(item, value=False, key=f"exclusion_{idx}"):
+            selected_exclusions.append(item)
+
+with st.expander("🔧 Key Components", expanded=False):
+    default_components = [
+        {"Items": "Belts", "Make": "Forbo / Derco / Habasit"},
+        {"Items": "Rollers", "Make": "Falcon"},
+        {"Items": "Cross Belt Carriers", "Make": "Falcon"},
+        {"Items": "Linear Motors (LIM / LSM / Linear Induction)", "Make": "Falcon / SEW / FWD (as applicable)"},
+        {"Items": "Feed Line Motors", "Make": "Falcon"},
+        {"Items": "Volume / Barcode Scanners", "Make": "SICK / Cognex / Similar"},
+        {"Items": "Weighing Scales", "Make": "Bizerba / Mettler Toledo / Equivalent"},
+        {"Items": "Encoders", "Make": "SICK / Falcon"},
+        {"Items": "Sensors", "Make": "SICK / Leuze / P&F"},
+        {"Items": "PLC", "Make": "Siemens / Omron"},
+        {"Items": "Control Panels", "Make": "Rittal / BCH"},
+        {"Items": "VFDs", "Make": "Siemens / Lenze / AB / Omron"},
+        {"Items": "Cables", "Make": "LAPP / Equivalent"},
+        {"Items": "Switch Gear", "Make": "Schneider / Equivalent"},
+        {"Items": "Bearings", "Make": "NTN / SKF / Equivalent"},
+        {"Items": "Power Transmission Systems", "Make": "Vahle"},
+        {"Items": "HMIs", "Make": "Siemens / Omron"},
+        {"Items": "MDR", "Make": "Pulse / Itoh Denki"},
+        {"Items": "Data Transmission System", "Make": "Siemens"},
+    ]
+    
+    if "key_components_df" not in st.session_state:
+        st.session_state["key_components_df"] = pd.DataFrame(default_components)
+    
+    key_components_edited = st.data_editor(
+        st.session_state["key_components_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="key_editor"
+    )
 
 st.divider()
 
@@ -1278,7 +2971,7 @@ def build_cover_letter_section(doc, letter_text):
                 apply_normal_style(p)
 
 
-def build_front_page_section(doc, project_title, offer_ref, contact_name, contact_email, contact_phone, layout_image):
+def build_front_page_section(doc, project_title, offer_ref, contact_name, contact_email, contact_phone, layout_png_path):
     """Build front page (page 2) - NO HEADER for this section"""
     doc.add_page_break()
 
@@ -1296,11 +2989,42 @@ def build_front_page_section(doc, project_title, offer_ref, contact_name, contac
     # Some vertical spacing
     doc.add_paragraph("")
 
-    # Layout image
-    add_centered_upload_image(doc, layout_image, width_in=6.5)
-
-    # More spacing
-    doc.add_paragraph("")
+    # Layout image - use the same image as in Proposed System Description
+    # Cropped to 5.0 inches to fit everything on single page
+    if layout_png_path and os.path.exists(layout_png_path):
+        # Crop image before inserting
+        try:
+            from PIL import Image
+            img = Image.open(layout_png_path)
+            
+            # Crop 10% from each side to remove whitespace
+            width, height = img.size
+            left = width * 0.1
+            top = height * 0.1
+            right = width * 0.9
+            bottom = height * 0.9
+            
+            img_cropped = img.crop((left, top, right, bottom))
+            
+            # Save to temporary buffer
+            img_buffer = io.BytesIO()
+            img_cropped.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+            
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(img_buffer, width=Inches(5.0))
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        except Exception as e:
+            # Fallback to original image if cropping fails
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(layout_png_path, width=Inches(5.0))
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        p = doc.add_paragraph()
+        run = p.add_run("Layout image will be provided.")
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     # Contact box at bottom
     contact_lines = [
@@ -1320,8 +3044,77 @@ def build_front_page_section(doc, project_title, offer_ref, contact_name, contac
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 
-def build_glossary_section(doc):
-    """Build glossary/table of contents section with automatic TOC"""
+def build_glossary_section(doc, detected_terms):
+    """Build Glossary section with table of detected terms - inserted before Executive Summary"""
+    doc.add_page_break()
+    
+    # Add heading using standard formatting
+    add_numbered_heading(doc, "Glossary", level=1, counter=None)
+    
+    if not detected_terms:
+        p = doc.add_paragraph("No glossary terms detected in this document.")
+        apply_normal_style(p)
+        return
+    
+    # Create table with 3 columns: S. No., Term, Description
+    table = doc.add_table(rows=1, cols=3)
+    apply_table_style(table)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    
+    # Header row
+    hdr_cells = table.rows[0].cells
+    headers = ["S. No.", "Term", "Description"]
+    for i, text in enumerate(headers):
+        p = hdr_cells[i].paragraphs[0]
+        p.text = ""
+        run = p.add_run(text)
+        run.font.name = 'Calibri'
+        run.font.size = Pt(11)
+        run.font.bold = True
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    
+    # Data rows
+    for idx, (term, desc) in enumerate(detected_terms, start=1):
+        row_cells = table.add_row().cells
+        
+        # S. No.
+        p0 = row_cells[0].paragraphs[0]
+        p0.text = ""
+        r0 = p0.add_run(str(idx))
+        r0.font.name = 'Calibri'
+        r0.font.size = Pt(11)
+        r0.font.bold = True
+        p0.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        row_cells[0].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        
+        # Term
+        p1 = row_cells[1].paragraphs[0]
+        p1.text = ""
+        r1 = p1.add_run(term)
+        r1.font.name = 'Calibri'
+        r1.font.size = Pt(11)
+        r1.font.bold = True
+        p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        row_cells[1].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        
+        # Description
+        p2 = row_cells[2].paragraphs[0]
+        p2.text = ""
+        r2 = p2.add_run(desc)
+        r2.font.name = 'Calibri'
+        r2.font.size = Pt(11)
+        p2.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        row_cells[2].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    
+    # Set column widths
+    table.columns[0].width = Inches(0.8)
+    table.columns[1].width = Inches(1.5)
+    table.columns[2].width = Inches(4.2)
+
+
+def build_table_of_contents_section(doc):
+    """Build table of contents section with automatic TOC"""
     doc.add_page_break()
     
     p = doc.add_heading("Table of Contents", level=1)
@@ -1377,7 +3170,7 @@ def build_executive_summary_section(doc, exec_summary_text, counter):
         # Check if it's a bullet point line
         if stripped.startswith("•") or stripped.startswith("-"):
             bullet_text = stripped.lstrip("•- ").strip()
-            p = doc.add_paragraph(style="List Bullet")
+            p = doc.add_paragraph(style='List Bullet')
             if "**" in bullet_text:
                 parts = bullet_text.split("**")
                 for i, part in enumerate(parts):
@@ -1507,7 +3300,7 @@ def build_company_profile_section(doc, counter):
     ]
 
     for point in bullet_points:
-        p = doc.add_paragraph(point, style="List Bullet")
+        p = doc.add_paragraph(point, style='List Bullet')
         apply_normal_style(p)
 
     add_centered_image(doc, os.path.join(STATIC_ABOUT_DIR, "9.png"), width_in=5)
@@ -1535,7 +3328,7 @@ def build_reference_projects_section(doc, counter):
         "The references list presented below focuses on Sortation Solution –",
     ]
     for text in bullets_intro:
-        p = doc.add_paragraph(text, style="List Bullet")
+        p = doc.add_paragraph(text, style='List Bullet')
         apply_normal_style(p)
 
     # Project 1
@@ -1559,7 +3352,7 @@ def build_reference_projects_section(doc, counter):
         "Building Size: 700,000 Sq. Ft.",
     ]
     for t in spec1:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1586,7 +3379,7 @@ def build_reference_projects_section(doc, counter):
         "WCS.",
     ]
     for t in ktm1:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1626,7 +3419,7 @@ def build_reference_projects_section(doc, counter):
         "Building Size: 200,000 Sq. Ft.",
     ]
     for t in spec2:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1648,7 +3441,7 @@ def build_reference_projects_section(doc, counter):
         "WCS Software System.",
     ]
     for t in ktm2:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1684,7 +3477,7 @@ def build_reference_projects_section(doc, counter):
         "End Destinations: 40 Collection Type Chutes.",
     ]
     for t in spec3:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1705,7 +3498,7 @@ def build_reference_projects_section(doc, counter):
         "WCS Software System.",
     ]
     for t in ktm3:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1739,7 +3532,7 @@ def build_reference_projects_section(doc, counter):
         "End Destinations: 58 Nos.",
     ]
     for t in spec4:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1756,7 +3549,7 @@ def build_reference_projects_section(doc, counter):
         "WCS Software System.",
     ]
     for t in ktm4:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1791,7 +3584,7 @@ def build_reference_projects_section(doc, counter):
         "End Destinations: 369 Nos.",
     ]
     for t in spec5:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1809,7 +3602,7 @@ def build_reference_projects_section(doc, counter):
         "WCS Software System.",
     ]
     for t in ktm5:
-        p = doc.add_paragraph(t, style="List Bullet")
+        p = doc.add_paragraph(t, style='List Bullet')
         apply_normal_style(p)
 
     p = doc.add_paragraph()
@@ -1870,10 +3663,16 @@ def build_handled_spectrum_section(doc, counter, project_name, client_name):
                 run.font.name = 'Calibri (Body)'
                 run.font.size = Pt(11)
 
+    # Add data rows only (skip header row creation, we already have it)
+    row_idx = 1
     for spec, data in tpl.spec_table.items():
         if str(data["value"]).strip() == "":
             continue  # Skip empty rows
-        row_cells = table.add_row().cells
+        if row_idx >= len(table.rows):
+            row_cells = table.add_row().cells
+        else:
+            row_cells = table.rows[row_idx].cells
+        row_idx += 1
         row_cells[0].text = spec
         row_cells[1].text = data["unit"]
         row_cells[2].text = data["value"]
@@ -1939,15 +3738,375 @@ def build_handled_spectrum_section(doc, counter, project_name, client_name):
         apply_normal_style(p)
 
 
+def build_description_of_components_section(doc, counter, sorter_spec: dict | None):
+    """
+    Build Description of Components of Equipment section with fixed content and 
+    Technical Specification of Sorter from Loop CBS Excel.
+    """
+    # Main heading
+    add_numbered_heading(doc, "Description of Components of Equipment", counter=counter)
+    doc.add_paragraph()
+
+    # Elements of the sorting system
+    add_numbered_subheading(doc, "Elements of the sorting system", f"{counter}.1")
+    
+    p = doc.add_paragraph()
+    p.add_run("1. Cross Belt Sorter\n").font.name = 'Calibri'
+    p.add_run("2. Scanning & Sensing on Sorter\n").font.name = 'Calibri'
+    p.add_run("3. Conveyor System\n").font.name = 'Calibri'
+    p.add_run("4. Steel Works – Mezzanine & Staircases").font.name = 'Calibri'
+    apply_normal_style(p)
+    doc.add_paragraph()
+
+    # Cross Belt Sorter
+    add_numbered_subheading(doc, "Cross Belt Sorter", f"{counter}.2")
+    
+    add_paragraph(doc, "Cross Belt Sorter is capable of sorting extremely high volume of versatile products in a gentle manner.")
+    add_paragraph(doc, "Falcon's Cross belt sorter is powered by high efficiency linear motors and is based on 100% non-touch actuation technology leading to high throughput capabilities with extremely low noise levels.")
+    add_paragraph(doc, "Falcon's Cross belt sorter is modular in design. It can be easily extended as per future requirements.")
+    
+    add_centered_image(doc, COMPONENT_IMAGES["cross_belt_sorter"], width_in=4.0)
+
+    # CBS Carrier
+    add_numbered_subheading(doc, "CBS Carrier", f"{counter}.3")
+    
+    add_paragraph(doc, "Falcon Autotech's CBS offers one of the highest belt width to carrier pitch ratios in the market today.")
+    add_paragraph(doc, "This additional belt width makes the system capable of handling larger product sizes without compromising on throughput. It also reduces the dead area between carrier belts, significantly reducing the number of in-betweeners and non-sortable parcel recirculation.")
+    
+    add_centered_image(doc, COMPONENT_IMAGES["cbs_carrier"], width_in=4.0)
+    doc.add_paragraph()
+
+    # Servo Roller (Level 3 subheading)
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.1 Servo Roller")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "High powered DC drive servo rollers are used to actuate the carrier belts, thereby eliminating the need for complicated drive transfer mechanisms and simplifying system installation and maintenance.")
+    add_centered_image(doc, COMPONENT_IMAGES["servo_roller"], width_in=3.5)
+    doc.add_paragraph()
+
+    # Chassis
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.2 Chassis")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Falcon Autotech's cross belt carrier chassis is made up of lightweight aluminium, which makes it light yet sturdy. This reduced weight leads to substantial power savings over a considerable period of usage.")
+    add_centered_image(doc, COMPONENT_IMAGES["chassis"], width_in=3.5)
+    doc.add_paragraph()
+
+    # Carrier Wheels
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.3 Carrier Wheels")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Carrier wheels are thoroughly tested and proven for a long life cycle.")
+    add_centered_image(doc, COMPONENT_IMAGES["wheel"], width_in=3.5)
+    doc.add_paragraph()
+
+    # Friction Wheel Drive
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.4 Friction Wheel Drive")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Falcon can provide the indigenously developed Friction Wheel Drive (FWD) to drive the cross belt loop. This driving mechanism operates on the principle of friction. The unit comprises two independent motor-driven wheels that spin in opposite directions, synchronised.")
+    add_paragraph(doc, "FWDs are highly energy-efficient drives that promote sustainability compared to traditional linear induction or synchronous motor drives.")
+    add_centered_image(doc, COMPONENT_IMAGES["friction_wheel"], width_in=4.0)
+
+    # Non-contact based linear motor drive
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.5 Non-contact based linear motor drive")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Non-contact based linear induction motors can be configured at variable speeds depending upon operational requirements, providing maximum flexibility.")
+    add_centered_image(doc, COMPONENT_IMAGES["linear"], width_in=4.0)
+    add_paragraph(doc, "The customer can choose the preferred drive system based on performance and energy-efficiency requirements.")
+    doc.add_paragraph()
+
+    # Power Transmission
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.6 Power Transmission")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Power transmission to carriers is provided over sliding contacts that require low maintenance and offer high levels of reliability.")
+    add_centered_image(doc, COMPONENT_IMAGES["power"], width_in=4.0)
+    doc.add_paragraph()
+
+    # Data Transmission
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.7 Data Transmission")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "The R-Coax cable is used for data distribution in the sorter. This leaky wave cable runs throughout the sorter length, transmitting data continuously. An antenna mounted on the super master carriage receives the signal from this cable while on the move, wirelessly.")
+    add_centered_image(doc, COMPONENT_IMAGES["rcoax"], width_in=4.0)
+
+    # Carriers positioning system
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.8 Carriers positioning system")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "The positioning system determines the exact location of each carrier in the loop at any given point in time.")
+    add_paragraph(doc, "A plastic tape strip of barcodes (QR codes) runs along the sorter loop, which is continuously scanned by scanners placed on a master carrier to track and control the position of every carrier.")
+    add_centered_image(doc, COMPONENT_IMAGES["carrier_position"], width_in=4.0)
+
+    # Technical Specification of Sorter
+    add_numbered_subheading(doc, "Technical Specification of Sorter", f"{counter}.4")
+
+    if sorter_spec is None:
+        add_paragraph(doc, "Technical specification of the sorter will be finalised based on project-specific configuration.")
+    else:
+        # Safely get values (fallbacks)
+        def gv(key: str, default: str = "-") -> str:
+            val = sorter_spec.get(key)
+            if val is None:
+                return default
+            s = str(val).strip()
+            return s if s else default
+
+        rows_data = [
+            ("Sorter Carrier Type", gv("sorter_carrier_type", "Loop CBS")),
+            ("Sorter Speed (m/s)", gv("sorter_speed_mps")),
+            ("Sorter Loop Length (m)", gv("sorter_loop_length_m")),
+            ("Sorter Height (mm)", gv("sorter_height_mm")),
+            ("Sorter Actuation Technology", gv("actuation_technology", "Electric")),
+            ("Carrier Pitch (mm)", gv("carrier_pitch_mm")),
+            ("Number of Carriers", gv("number_of_carriers")),
+            ("Motor / Drive Type", gv("motor_drive_type")),
+            ("Power Consumption*", gv("power_consumption")),
+        ]
+
+        table = doc.add_table(rows=1, cols=2)
+        apply_table_style(table)
+        
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = "Technical Parameter"
+        hdr_cells[1].text = "Value"
+
+        for param, value in rows_data:
+            row_cells = table.add_row().cells
+            row_cells[0].text = param
+            row_cells[1].text = value
+
+        doc.add_paragraph()
+
+
+def add_paragraph(doc: Document, text: str):
+    """Add normal body paragraph with Calibri 11pt."""
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.font.name = "Calibri"
+    run.font.size = Pt(11)
+    return p
+
+
+def build_description_of_components_section(doc, counter, sorter_spec: dict | None):
+    """
+    Build Description of Components of Equipment section with fixed content and 
+    Technical Specification of Sorter from Loop CBS Excel.
+    """
+    doc.add_page_break()  # Start on new page
+    
+    # Main heading
+    add_numbered_heading(doc, "Description of Components of Equipment", counter=counter)
+    doc.add_paragraph()
+
+    # Elements of the sorting system
+    add_numbered_subheading(doc, "Elements of the sorting system", f"{counter}.1")
+    
+    p = doc.add_paragraph()
+    p.add_run("1. Cross Belt Sorter\\n").font.name = 'Calibri'
+    p.add_run("2. Scanning & Sensing on Sorter\\n").font.name = 'Calibri'
+    p.add_run("3. Conveyor System\\n").font.name = 'Calibri'
+    p.add_run("4. Steel Works – Mezzanine & Staircases").font.name = 'Calibri'
+    apply_normal_style(p)
+    doc.add_paragraph()
+
+    # Cross Belt Sorter
+    add_numbered_subheading(doc, "Cross Belt Sorter", f"{counter}.2")
+    
+    add_paragraph(doc, "Cross Belt Sorter is capable of sorting extremely high volume of versatile products in a gentle manner.")
+    add_paragraph(doc, "Falcon's Cross belt sorter is powered by high efficiency linear motors and is based on 100% non-touch actuation technology leading to high throughput capabilities with extremely low noise levels.")
+    add_paragraph(doc, "Falcon's Cross belt sorter is modular in design. It can be easily extended as per future requirements.")
+    
+    add_centered_image(doc, COMPONENT_IMAGES["cross_belt_sorter"], width_in=4.0)
+
+    # CBS Carrier
+    add_numbered_subheading(doc, "CBS Carrier", f"{counter}.3")
+    
+    add_paragraph(doc, "Falcon Autotech's CBS offers one of the highest belt width to carrier pitch ratios in the market today.")
+    add_paragraph(doc, "This additional belt width makes the system capable of handling larger product sizes without compromising on throughput. It also reduces the dead area between carrier belts, significantly reducing the number of in-betweeners and non-sortable parcel recirculation.")
+    
+    add_centered_image(doc, COMPONENT_IMAGES["cbs_carrier"], width_in=4.0)
+    doc.add_paragraph()
+
+    # Servo Roller (Level 3 subheading)
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.1 Servo Roller")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "High powered DC drive servo rollers are used to actuate the carrier belts, thereby eliminating the need for complicated drive transfer mechanisms and simplifying system installation and maintenance.")
+    add_centered_image(doc, COMPONENT_IMAGES["servo_roller"], width_in=3.5)
+    doc.add_paragraph()
+
+    # Chassis
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.2 Chassis")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Falcon Autotech's cross belt carrier chassis is made up of lightweight aluminium, which makes it light yet sturdy. This reduced weight leads to substantial power savings over a considerable period of usage.")
+    add_centered_image(doc, COMPONENT_IMAGES["chassis"], width_in=3.5)
+    doc.add_paragraph()
+
+    # Carrier Wheels
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.3 Carrier Wheels")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Carrier wheels are thoroughly tested and proven for a long life cycle.")
+    add_centered_image(doc, COMPONENT_IMAGES["wheel"], width_in=3.5)
+    doc.add_paragraph()
+
+    # Friction Wheel Drive
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.4 Friction Wheel Drive")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Falcon can provide the indigenously developed Friction Wheel Drive (FWD) to drive the cross belt loop. This driving mechanism operates on the principle of friction. The unit comprises two independent motor-driven wheels that spin in opposite directions, synchronised.")
+    add_paragraph(doc, "FWDs are highly energy-efficient drives that promote sustainability compared to traditional linear induction or synchronous motor drives.")
+    add_centered_image(doc, COMPONENT_IMAGES["friction_wheel"], width_in=4.0)
+
+    # Non-contact based linear motor drive
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.5 Non-contact based linear motor drive")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Non-contact based linear induction motors can be configured at variable speeds depending upon operational requirements, providing maximum flexibility.")
+    add_centered_image(doc, COMPONENT_IMAGES["linear"], width_in=4.0)
+    add_paragraph(doc, "The customer can choose the preferred drive system based on performance and energy-efficiency requirements.")
+    doc.add_paragraph()
+
+    # Power Transmission
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.6 Power Transmission")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "Power transmission to carriers is provided over sliding contacts that require low maintenance and offer high levels of reliability.")
+    add_centered_image(doc, COMPONENT_IMAGES["power"], width_in=4.0)
+    doc.add_paragraph()
+
+    # Data Transmission
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.7 Data Transmission")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "The R-Coax cable is used for data distribution in the sorter. This leaky wave cable runs throughout the sorter length, transmitting data continuously. An antenna mounted on the super master carriage receives the signal from this cable while on the move, wirelessly.")
+    add_centered_image(doc, COMPONENT_IMAGES["rcoax"], width_in=4.0)
+
+    # Carriers positioning system
+    p = doc.add_paragraph()
+    run = p.add_run(f"{counter}.3.8 Carriers positioning system")
+    run.font.name = 'Calibri'
+    run.font.size = Pt(11)
+    run.font.bold = True
+    run.font.color.rgb = HEADING_COLOR
+    
+    add_paragraph(doc, "The positioning system determines the exact location of each carrier in the loop at any given point in time.")
+    add_paragraph(doc, "A plastic tape strip of barcodes (QR codes) runs along the sorter loop, which is continuously scanned by scanners placed on a master carrier to track and control the position of every carrier.")
+    add_centered_image(doc, COMPONENT_IMAGES["carrier_position"], width_in=4.0)
+
+    # Technical Specification of Sorter
+    add_numbered_subheading(doc, "Technical Specification of Sorter", f"{counter}.4")
+
+    if sorter_spec is None:
+        add_paragraph(doc, "Technical specification of the sorter will be finalised based on project-specific configuration.")
+    else:
+        # Safely get values (fallbacks)
+        def gv(key: str, default: str = "-") -> str:
+            val = sorter_spec.get(key)
+            if val is None:
+                return default
+            s = str(val).strip()
+            return s if s else default
+
+        rows_data = [
+            ("Sorter Carrier Type", gv("sorter_carrier_type", "Loop CBS")),
+            ("Sorter Speed (m/s)", gv("sorter_speed_mps")),
+            ("Sorter Loop Length (m)", gv("sorter_loop_length_m")),
+            ("Sorter Height (mm)", gv("sorter_height_mm")),
+            ("Sorter Actuation Technology", gv("actuation_technology", "Electric")),
+            ("Carrier Pitch (mm)", gv("carrier_pitch_mm")),
+            ("Number of Carriers", gv("number_of_carriers")),
+            ("Motor / Drive Type", gv("motor_drive_type")),
+            ("Power Consumption*", gv("power_consumption")),
+        ]
+
+        table = doc.add_table(rows=1, cols=2)
+        apply_table_style(table)
+        
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = "Technical Parameter"
+        hdr_cells[1].text = "Value"
+
+        for param, value in rows_data:
+            row_cells = table.add_row().cells
+            row_cells[0].text = param
+            row_cells[1].text = value
+
+        doc.add_paragraph()
+
+
 def build_capacity_calculations_section(doc, counter, client_name, project_name, capacity_excel):
     """Add Sorter System Capacity section using capacity_calculations.py logic"""
-    from capacity_calculations import build_capacity_prompt_from_excel, call_groq_for_capacity, add_capacity_section_to_doc
     if capacity_excel:
         excel_bytes = capacity_excel.read()
         prompt = build_capacity_prompt_from_excel(excel_bytes, client_name, project_name)
         cap_data = call_groq_for_capacity(prompt)
         doc.add_page_break()
-        add_capacity_section_to_doc(doc, client_name, project_name, cap_data)
+        add_capacity_section_to_doc(doc, client_name, project_name, cap_data, counter)
 
 
 def build_electrical_section(doc, counter):
@@ -1962,7 +4121,7 @@ def build_electrical_section(doc, counter):
     apply_normal_style(p)
     
     for item in ["Main Control Cabinet", "Induct Control Panels", "Remote Cabinets for Sorter I/O", "Scanner Control cabinets"]:
-        p = doc.add_paragraph(item, style="List Bullet")
+        p = doc.add_paragraph(item, style='List Bullet')
         apply_normal_style(p)
     
     add_numbered_subheading(doc, "Reference Picture of Power Distribution Panel", f"{counter}.1")
@@ -2168,7 +4327,7 @@ def build_wcs_section(doc, counter, client_name):
         apply_normal_style(p)
         
         for comp_item in comp_items:
-            p = doc.add_paragraph(comp_item, style="List Bullet")
+            p = doc.add_paragraph(comp_item, style='List Bullet')
             apply_normal_style(p)
     
     # Disaster Handling
@@ -2177,7 +4336,7 @@ def build_wcs_section(doc, counter, client_name):
     run.bold = True
     apply_normal_style(p)
     
-    p = doc.add_paragraph("Recovery Time Objective (RTO) & Data Loss Objective (RPO):", style="List Bullet")
+    p = doc.add_paragraph("Recovery Time Objective (RTO) & Data Loss Objective (RPO):", style='List Bullet')
     apply_normal_style(p)
     
     for disaster_item in [
@@ -2224,7 +4383,7 @@ def build_wcs_section(doc, counter, client_name):
     ]
     
     for feature in dashboard_features:
-        p = doc.add_paragraph(feature, style="List Bullet")
+        p = doc.add_paragraph(feature, style='List Bullet')
         apply_normal_style(p)
     
     p = doc.add_paragraph(
@@ -2242,7 +4401,7 @@ def build_wcs_section(doc, counter, client_name):
     ]
     
     for screen_desc, screen_img in dashboard_screens:
-        p = doc.add_paragraph(screen_desc, style="List Bullet")
+        p = doc.add_paragraph(screen_desc, style='List Bullet')
         apply_normal_style(p)
         add_centered_image(doc, screen_img)
     
@@ -2258,7 +4417,7 @@ def build_wcs_section(doc, counter, client_name):
     ]
     
     for screen in additional_screens:
-        p = doc.add_paragraph(screen, style="List Bullet")
+        p = doc.add_paragraph(screen, style='List Bullet')
         apply_normal_style(p)
     
     # D. Communication Architecture
@@ -2306,7 +4465,7 @@ def build_wcs_section(doc, counter, client_name):
         apply_normal_style(p)
         
         for device_item in device_items:
-            p = doc.add_paragraph(device_item, style="List Bullet")
+            p = doc.add_paragraph(device_item, style='List Bullet')
             apply_normal_style(p)
     
     # E. Client Communication
@@ -2325,7 +4484,7 @@ def build_wcs_section(doc, counter, client_name):
     ]
     
     for method in transfer_methods:
-        p = doc.add_paragraph(method, style="List Bullet")
+        p = doc.add_paragraph(method, style='List Bullet')
         apply_normal_style(p)
     
     p = doc.add_paragraph()
@@ -2337,7 +4496,7 @@ def build_wcs_section(doc, counter, client_name):
         "The data sent to the client can include sortation results, system performance reports, and operational "
         "analytics, which can be used for further processing or reporting within external systems like Warehouse "
         "Management Systems (WMS) and Transport Management Systems (TMS).",
-        style="List Bullet"
+        style='List Bullet'
     )
     apply_normal_style(p)
     
@@ -2423,7 +4582,7 @@ def build_scada_section(doc, counter, client_name):
     ]
     
     for item in functions:
-        p = doc.add_paragraph(item, style="List Bullet")
+        p = doc.add_paragraph(item, style='List Bullet')
         apply_normal_style(p)
     
     add_numbered_subheading(doc, "FIELD DATA ACQUISITION", f"{counter}.1")
@@ -2631,7 +4790,7 @@ def build_program_org_section(doc, counter, client_name, gantt_file):
     ]
     
     for b in bullets:
-        p = doc.add_paragraph(b, style="List Bullet")
+        p = doc.add_paragraph(b, style='List Bullet')
         apply_normal_style(p)
     
     p = doc.add_paragraph(
@@ -2694,7 +4853,7 @@ def build_client_responsibility_section(doc, counter, client_name):
         apply_normal_style(p)
         
         for b in bullets:
-            p = doc.add_paragraph(b, style="List Bullet")
+            p = doc.add_paragraph(b, style='List Bullet')
             apply_normal_style(p)
 
 def build_handover_section(doc, counter):
@@ -2885,7 +5044,7 @@ def build_warranty_section(doc, counter, warranty_type, duration, start_cond, ex
     ]
     
     for item in coverage:
-        p = doc.add_paragraph(item, style="List Bullet")
+        p = doc.add_paragraph(item, style='List Bullet')
         apply_normal_style(p)
     
     p = doc.add_paragraph("The following items are excluded from warranty:")
@@ -2900,7 +5059,7 @@ def build_warranty_section(doc, counter, warranty_type, duration, start_cond, ex
     ]
     
     for item in exclusions:
-        p = doc.add_paragraph(item, style="List Bullet")
+        p = doc.add_paragraph(item, style='List Bullet')
         apply_normal_style(p)
     
     if transport_text:
@@ -2950,8 +5109,360 @@ def build_exclusions_section(doc, counter, selected_exclusions):
     all_exclusions = fixed_exclusions + selected_exclusions
     
     for item in all_exclusions:
-        p = doc.add_paragraph(item, style="List Bullet")
+        p = doc.add_paragraph(item, style='List Bullet')
         apply_normal_style(p)
+
+def build_proposed_system_technical_details_section(doc, counter, bom_json):
+    """Build Proposed System Technical Details section with 3 subsections"""
+    doc.add_page_break()
+    
+    add_numbered_heading(doc, "Proposed System Technical Details", counter=counter)
+    
+    if not bom_json or "sections" not in bom_json:
+        p = doc.add_paragraph("No technical details available.")
+        apply_normal_style(p)
+        return
+    
+    section_number = 1
+    for section in bom_json.get("sections", []):
+        title = section.get("title", "")
+        items = section.get("items", [])
+        if not items:
+            continue
+        
+        # Add subsection heading (e.g., "14.1 Mechanical equipment")
+        add_numbered_subheading(doc, title, f"{counter}.{section_number}")
+        section_number += 1
+        
+        # Create table with 4 columns: Pos., Qty., Description, Value
+        table = doc.add_table(rows=1, cols=4)
+        apply_table_style(table)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        
+        # Header row
+        hdr = table.rows[0].cells
+        hdr[0].text = "Pos."
+        hdr[1].text = "Qty."
+        hdr[2].text = "Description"
+        hdr[3].text = "Value"
+        
+        # Format header row
+        for cell in hdr:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = 'Calibri'
+                    run.font.size = Pt(11)
+                    run.font.bold = True
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        
+        # Add data rows
+        for item in items:
+            row = table.add_row().cells
+            
+            # Pos.
+            row[0].text = str(item.get("pos", ""))
+            
+            # Qty.
+            row[1].text = item.get("qty") or ""
+            
+            # Description (multiple lines)
+            desc_lines = item.get("description_lines") or []
+            row[2].text = "\n".join(desc_lines)
+            
+            # Value (multiple lines)
+            value_lines = item.get("value_lines") or []
+            row[3].text = "\n".join(value_lines)
+            
+            # Format each cell
+            for cell in row:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.name = 'Calibri'
+                        run.font.size = Pt(11)
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        
+        # Set column widths
+        table.columns[0].width = Inches(0.5)
+        table.columns[1].width = Inches(1.2)
+        table.columns[2].width = Inches(3.5)
+        table.columns[3].width = Inches(1.3)
+        
+        # Add spacing after table
+        doc.add_paragraph()
+
+def build_proposed_system_description_section(doc, counter, client_name, project_name, 
+                                              process_flow_text, layout_png_path):
+    """Build Proposed System Description section (5.0)"""
+    doc.add_page_break()
+    
+    add_numbered_heading(doc, "Proposed System Description", counter=counter)
+    
+    # 5.1 Objective
+    add_numbered_subheading(doc, "Objective", f"{counter}.1")
+    objective_text = (
+        "The purpose of this proposal is to present the design, manufacturing, "
+        "installation, commissioning, testing, and acceptance testing of the Cross Belt Sorter "
+        f"system for sorting shipments, as per {client_name} requirements."
+    )
+    p = doc.add_paragraph(objective_text)
+    apply_normal_style(p)
+    doc.add_paragraph("")
+    
+    # 5.2 Summary of the System (layout PNG)
+    add_numbered_subheading(doc, "Summary of the System", f"{counter}.2")
+    
+    if layout_png_path and os.path.exists(layout_png_path):
+        p = doc.add_paragraph(
+            "The following layout view illustrates the overall arrangement of infeed conveyors, sorter loop, "
+            "and output chutes for the proposed system."
+        )
+        apply_normal_style(p)
+        doc.add_paragraph("")
+        p = doc.add_paragraph()
+        run = p.add_run()
+        run.add_picture(layout_png_path, width=Inches(6.5))
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_paragraph("")
+    else:
+        p = doc.add_paragraph("The detailed layout is provided separately in the attached drawing.")
+        apply_normal_style(p)
+        doc.add_paragraph("")
+    
+    # 5.3 Process Flow of the System
+    add_numbered_subheading(doc, "Process Flow of the System", f"{counter}.3")
+    for line in process_flow_text.splitlines():
+        line = line.strip()
+        if not line: continue
+        
+        # Parse and apply bold formatting for **text**
+        p = doc.add_paragraph()
+        parts = re.split(r'(\*\*[^\*]+\*\*)', line)
+        for part in parts:
+            if part.startswith('**') and part.endswith('**'):
+                # Bold text
+                text = part[2:-2]
+                run = p.add_run(text)
+                run.bold = True
+            else:
+                # Normal text
+                run = p.add_run(part)
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+    doc.add_paragraph("")
+    
+    # 5.4 Main Benefits
+    add_numbered_subheading(doc, "Main Benefits of the Proposed Solution", f"{counter}.4")
+    benefits = [
+        "High operational throughput.",
+        "Low occupancy of floor space in the building.",
+        "Narrow discharge centers for the increased number of splits in limited space.",
+        (
+            "FALCON's CBS can adapt to changing business requirements by adjusting its speed "
+            "to match the operational throughput requirement, thereby leading to power savings "
+            "and reduced system wear & tear."
+        ),
+    ]
+    for b in benefits:
+        p = doc.add_paragraph(b, style='List Bullet')
+        apply_normal_style(p)
+
+def build_system_description_section(doc, counter, system_description_text):
+    """Build comprehensive System Description section"""
+    doc.add_page_break()
+    add_numbered_heading(doc, "System Description", counter=counter)
+    
+    # Parse the generated system description text and format it
+    # First, detect and extract JSON tables
+    table_pattern = r'TABLE_START\s*\n(\{[^}]*\})\s*\nTABLE_END'
+    tables = []
+    table_positions = []
+    
+    for match in re.finditer(table_pattern, system_description_text, re.DOTALL):
+        try:
+            table_json = json.loads(match.group(1))
+            tables.append(table_json)
+            table_positions.append((match.start(), match.end()))
+        except json.JSONDecodeError:
+            pass
+    
+    # Replace table blocks with placeholders
+    text_with_placeholders = system_description_text
+    for i, (start, end) in enumerate(reversed(table_positions)):
+        text_with_placeholders = text_with_placeholders[:start] + f"__TABLE_{len(table_positions)-1-i}__" + text_with_placeholders[end:]
+    
+    # Strip ```json and ``` markers that may appear in LLM output
+    text_with_placeholders = re.sub(r'```json\s*', '', text_with_placeholders)
+    text_with_placeholders = re.sub(r'```\s*', '', text_with_placeholders)
+    
+    lines = text_with_placeholders.strip().split('\n')
+    
+    sub_counter = 1
+    for line in lines:
+        line_stripped = line.strip()
+        # Skip empty lines
+        if not line_stripped:
+            doc.add_paragraph("")
+            continue
+        
+        # Check for table placeholder
+        table_match = re.match(r'__TABLE_(\d+)__', line_stripped)
+        if table_match:
+            table_idx = int(table_match.group(1))
+            if table_idx < len(tables):
+                table_data = tables[table_idx]
+                # Add table title if present
+                if table_data.get('title'):
+                    p = doc.add_paragraph()
+                    run = p.add_run(table_data['title'])
+                    run.bold = True
+                    run.font.name = "Calibri"
+                    run.font.size = Pt(11)
+                    p.paragraph_format.space_before = Pt(6)
+                    p.paragraph_format.space_after = Pt(3)
+                
+                # Create table
+                headers = table_data.get('headers', [])
+                rows = table_data.get('rows', [])
+                if headers and rows:
+                    table = doc.add_table(rows=1, cols=len(headers))
+                    apply_table_style(table)
+                    
+                    # Header row
+                    hdr_cells = table.rows[0].cells
+                    for i, header in enumerate(headers):
+                        hdr_cells[i].text = str(header)
+                        for paragraph in hdr_cells[i].paragraphs:
+                            for run in paragraph.runs:
+                                run.font.bold = True
+                                run.font.name = 'Calibri (Body)'
+                                run.font.size = Pt(11)
+                    
+                    # Data rows
+                    for row_data in rows:
+                        row_cells = table.add_row().cells
+                        for i, cell_data in enumerate(row_data):
+                            row_cells[i].text = str(cell_data)
+                            for paragraph in row_cells[i].paragraphs:
+                                apply_normal_style(paragraph)
+                doc.add_paragraph("")  # spacing after table
+            continue
+        
+        # Check for markdown heading (## Heading)
+        if line_stripped.startswith('##'):
+            heading_text = line_stripped.lstrip('#').strip()
+            # Use numbered subheading for consistency
+            add_numbered_subheading(doc, heading_text, f"{counter}.{sub_counter}")
+            sub_counter += 1
+            continue
+        
+        # Check for subsection heading pattern: •	*Heading Text**
+        # This is used by LLM to denote subsections
+        subsection_match = re.match(r'^[\u2022\-\*]\s*\*([^\*]+)\*\*$', line_stripped)
+        if subsection_match:
+            heading_text = subsection_match.group(1).strip()
+            # Use numbered subheading for consistency
+            add_numbered_subheading(doc, heading_text, f"{counter}.{sub_counter}")
+            sub_counter += 1
+            continue
+        
+        # Check for bullet points (- or *)
+        if line_stripped.startswith('-') or line_stripped.startswith('*') or line_stripped.startswith('\u2022'):
+            bullet_text = line_stripped[1:].strip()
+            p = doc.add_paragraph(style='List Bullet')
+            parts = re.split(r'(\*\*[^\*]+\*\*)', bullet_text)
+            for part in parts:
+                if part.startswith('**') and part.endswith('**'):
+                    text = part[2:-2]  # Remove ** markers
+                    run = p.add_run(text)
+                    run.bold = True
+                else:
+                    run = p.add_run(part)
+                run.font.name = "Calibri"
+                run.font.size = Pt(11)
+            continue
+        # Check for numbered lists (1. 2. etc.)
+        if re.match(r'^\d+\.', line_stripped):
+            numbered_text = re.sub(r'^\d+\.\s*', '', line_stripped)
+            p = doc.add_paragraph(style='List Number')
+            parts = re.split(r'(\*\*[^\*]+\*\*)', numbered_text)
+            for part in parts:
+                if part.startswith('**') and part.endswith('**'):
+                    text = part[2:-2]  # Remove ** markers
+                    run = p.add_run(text)
+                    run.bold = True
+                else:
+                    run = p.add_run(part)
+                run.font.name = "Calibri"
+                run.font.size = Pt(11)
+            continue
+        # Regular paragraph with inline formatting
+        p = doc.add_paragraph()
+        parts = re.split(r'(\*\*[^\*]+\*\*)', line_stripped)
+        for part in parts:
+            if part.startswith('**') and part.endswith('**'):
+                text = part[2:-2]  # Remove ** markers
+                run = p.add_run(text)
+                run.bold = True
+            else:
+                run = p.add_run(part)
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+        p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+def build_concept_description_section(doc, counter, flowchart_png_bytes, drawio_url="https://app.diagrams.net/"):
+    """Build Concept Description section with Mermaid flowchart"""
+    doc.add_page_break()
+    
+    add_numbered_heading(doc, "Concept Description", counter=counter)
+    
+    p = doc.add_paragraph(
+        "The following flowchart illustrates the high-level process flow of the proposed system. "
+        "Clicking the diagram will open draw.io in a browser for editing or further detailing."
+    )
+    apply_normal_style(p)
+    
+    # Insert flowchart with clickable hyperlink
+    try:
+        image_stream = BytesIO(flowchart_png_bytes)
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Add relationship for external hyperlink
+        part = paragraph.part
+        r_id = part.relate_to(drawio_url, RT.HYPERLINK, is_external=True)
+        
+        # Create hyperlink element
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), r_id)
+        
+        # Create run with picture inside hyperlink
+        run = OxmlElement('w:r')
+        drawing = OxmlElement('w:drawing')
+        
+        # Add picture
+        run_obj = paragraph.add_run()
+        inline_shape = run_obj.add_picture(image_stream, width=Inches(3.5))
+        
+        # Move the drawing (picture) into hyperlink
+        drawing_element = run_obj._r.find(qn('w:drawing'))
+        if drawing_element is not None:
+            run.append(drawing_element)
+            hyperlink.append(run)
+            paragraph._p.append(hyperlink)
+            # Remove the original run
+            paragraph._p.remove(run_obj._r)
+        else:
+            # Fallback: just add picture normally if something goes wrong
+            pass
+            
+    except Exception as e:
+        # Fallback: insert without hyperlink
+        image_stream = BytesIO(flowchart_png_bytes)
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = paragraph.add_run()
+        run.add_picture(image_stream, width=Inches(3.5))
 
 # ==================== MAIN GENERATION ====================
 
@@ -2970,11 +5481,87 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                 st.error("Please enter a Project Name")
                 st.stop()
             
-            # Generate cover letter if needed
+            # Executive summary will be generated after process flow is created from DXF
+            exec_summary_text = None
+            
+            # Process DXF and generate Process Flow & Mermaid Flowchart if needed
+            process_flow_text = None
+            system_description_text = None
+            flowchart_png_bytes = None
+            layout_png_path = None
+            dxf_json = None
+            
+            if (include_proposed_system or include_concept_desc) and dxf_layout_file:
+                with st.spinner("🔧 Processing DXF and generating AI content..."):
+                    try:
+                        # Create temp directory
+                        tmp_dir = Path(tempfile.mkdtemp(prefix="proposal_"))
+                        
+                        # Save DXF file
+                        dxf_path = tmp_dir / dxf_layout_file.name
+                        dxf_path.write_bytes(dxf_layout_file.getvalue())
+                        
+                        # Extract DXF components
+                        st.info("📐 Extracting DXF components...")
+                        dxf_json = extract_dxf_components(dxf_path)
+                        
+                        # Print raw DXF extraction to console
+                        print("\n" + "="*80)
+                        print("RAW DXF EXTRACTION RESULT")
+                        print("="*80)
+                        print(json.dumps(dxf_json, indent=2, ensure_ascii=False))
+                        print("="*80 + "\n")
+                        
+                        # Generate Process Flow if Proposed System is included
+                        if include_proposed_system:
+                            st.info("✍️ Generating Process Flow with AI...")
+                            process_flow_text, _ = call_groq_for_process_flow(
+                                client_name, project_name, dxf_json
+                            )
+                            st.success("✅ Process Flow generated")
+                            time.sleep(2)  # Delay to avoid rate limits
+                    except Exception as e:
+                        st.warning(f"Could not process DXF for initial flow: {str(e)}")
+                        dxf_json = None
+                        process_flow_text = None
+            
+            # Generate cover letter AFTER process flow is created (to include high-level summary)
             cover_letter_text = None
             if offer_ref and sender_name:
-                with st.spinner("Generating cover letter with AI..."):
+                with st.spinner("Starting Build..."):
                     try:
+                        # Create enhanced high-level summary from process flow and DXF data
+                        process_flow_summary = ""
+                        if process_flow_text:
+                            lines = process_flow_text.strip().split('\n')
+                            # Extract main system components from process flow
+                            summary_components = []
+                            for line in lines[:5]:  # Look at first 5 lines for better coverage
+                                # Extract component names (remove numbering and description after colon)
+                                if ':' in line:
+                                    component = line.split(':')[0].strip()
+                                    # Remove numbering (1., 2., etc.)
+                                    component = component.lstrip('0123456789. ')
+                                    if component and len(component) > 3:  # Avoid empty or very short strings
+                                        summary_components.append(component)
+                            
+                            # Add key quantities from DXF if available
+                            quantities = []
+                            if dxf_json:
+                                if dxf_json.get('total_chutes', 0) > 0:
+                                    quantities.append(f"{dxf_json['total_chutes']} chutes")
+                                if dxf_json.get('total_operators', 0) > 0:
+                                    quantities.append(f"{dxf_json['total_operators']} operator stations")
+                                # Add other relevant quantities if present
+                                if dxf_json.get('scanner_systems', 0) > 0:
+                                    quantities.append(f"{dxf_json['scanner_systems']} scanner systems")
+                            
+                            # Combine components and quantities into natural summary
+                            if summary_components:
+                                process_flow_summary = ", ".join(summary_components[:3])  # First 3 components
+                                if quantities:
+                                    process_flow_summary += f" with {', '.join(quantities[:2])}"  # Add up to 2 quantities
+                        
                         cover_letter_text = call_groq_cover_letter(
                             client_name=client_name,
                             project_title=project_name,
@@ -2984,24 +5571,81 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                             invitation_date=invitation_date_str,
                             meeting_date=meeting_date_str,
                             sender_name=sender_name,
-                            sender_title=sender_title
+                            sender_title=sender_title,
+                            process_flow_summary=process_flow_summary
                         )
-                        st.success("Cover letter generated successfully")
+                        #st.success("Cover letter generated successfully")
                     except Exception as e:
                         st.warning(f"Could not generate cover letter: {str(e)}")
                         cover_letter_text = None
             
-            # Generate executive summary if needed
-            exec_summary_text = None
-            if include_exec_summary and exec_summary_pdf:
-                with st.spinner("📝 Generating executive summary with AI..."):
+            # Continue processing DXF if needed
+            if (include_proposed_system or include_concept_desc) and dxf_layout_file and process_flow_text:
+                with st.spinner("🔧 Continuing AI content generation..."):
                     try:
-                        system_text = extract_pdf_text(exec_summary_pdf)
-                        exec_summary_text = call_groq_exec_summary(system_text, client_name, project_name)
-                        st.success("Executive summary generated successfully")
+                        # Reuse temp directory from DXF processing
+                        if 'tmp_dir' not in locals():
+                            tmp_dir = Path(tempfile.mkdtemp(prefix="proposal_"))
+                        if 'dxf_path' not in locals() and dxf_layout_file:
+                            dxf_path = tmp_dir / dxf_layout_file.name
+                            if not dxf_path.exists():
+                                dxf_path.write_bytes(dxf_layout_file.getvalue())
+                        
+                        # Generate System Description from process flow and DXF if Proposed System is included
+                        if include_proposed_system and process_flow_text and dxf_json:
+                            st.info("📋 Generating comprehensive System Description with AI...")
+                            system_description_text = call_groq_for_system_description(
+                                process_flow_text, dxf_json, project_name
+                            )
+                            st.success("✅ System Description generated")
+                            time.sleep(2)  # Delay to avoid rate limits
+                        
+                        # Generate Executive Summary from process flow if included
+                        if include_exec_summary and process_flow_text:
+                            st.info("📝 Generating Executive Summary with AI...")
+                            exec_summary_text = call_groq_exec_summary(process_flow_text, client_name, project_name)
+                            st.success("✅ Executive Summary generated")
+                            time.sleep(2)  # Delay to avoid rate limits
+                        
+                        # Generate Mermaid Flowchart if Concept Description is included
+                        if include_concept_desc and process_flow_text:
+                            st.info("🗺️ Generating Mermaid flowchart...")
+                            mermaid_code = call_groq_for_mermaid(process_flow_text)
+                            flowchart_png_bytes, render_log = generate_mermaid_png(mermaid_code)
+                            st.success("✅ Flowchart rendered")
+                            time.sleep(2)  # Delay to avoid rate limits
+                        
+                        # Handle layout PNG - either uploaded or convert from DXF
+                        if layout_full_png:
+                            # User uploaded a PNG - use it
+                            layout_png_path = tmp_dir / layout_full_png.name
+                            layout_png_path.write_bytes(layout_full_png.getvalue())
+                            layout_png_path = str(layout_png_path)
+                            st.success("✅ Using uploaded layout PNG")
+                        else:
+                            # No PNG uploaded - try to convert DXF to PNG
+                            if CONVERTAPI_SECRET:
+                                try:
+                                    st.info("🔄 Converting DXF to PNG for layout visualization...")
+                                    png_path = convert_dxf_to_png(dxf_path)
+                                    if png_path and png_path.exists():
+                                        layout_png_path = str(png_path)
+                                        st.success("✅ DXF converted to PNG successfully")
+                                    else:
+                                        st.warning("⚠️ DXF to PNG conversion did not produce a file")
+                                        layout_png_path = None
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not convert DXF to PNG: {str(e)}")
+                                    layout_png_path = None
+                            else:
+                                st.warning("⚠️ CONVERTAPI_SECRET not configured. Cannot convert DXF to PNG. Please upload a PNG manually.")
+                                layout_png_path = None
+                        
                     except Exception as e:
-                        st.warning(f"Could not generate executive summary: {str(e)}")
-                        exec_summary_text = None
+                        st.warning(f"Could not process DXF file: {str(e)}")
+                        process_flow_text = None
+                        flowchart_png_bytes = None
+                        layout_png_path = None
             
             # Process costing file if commercial section is included
             price_data = None
@@ -3025,14 +5669,23 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                         st.warning(f"Could not process costing file: {str(e)}. Commercial section will be added as placeholder.")
                         price_data = None
             
-            # Save uploaded client logo temporarily
+            # Get client logo path - either from dropdown selection or uploaded file
             client_logo_path = None
-            if client_logo:
+            if selected_client != "None" and selected_client in CLIENT_LOGOS:
+                # Use logo from dropdown selection
+                client_logo_path = CLIENT_LOGOS[selected_client]
+            elif client_logo:
+                # Use uploaded logo - save temporarily
                 client_logo_path = f"temp_client_logo.{client_logo.name.split('.')[-1]}"
                 with open(client_logo_path, "wb") as f:
                     f.write(client_logo.getbuffer())
             
+            # ==================== START WITH FRESH DOCUMENT ====================
+            # Always start with a fresh document that has all standard Word styles
             doc = Document()
+            
+            # Ensure required list styles exist
+            ensure_list_styles(doc)
             
             # Set default font for the document
             style = doc.styles['Normal']
@@ -3040,19 +5693,22 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             font.name = 'Calibri (Body)'
             font.size = Pt(11)
             
-            # ==================== COVER LETTER (NO HEADER) ====================
+            # ==================== ADD HEADER/FOOTER TO MAIN DOCUMENT ====================
+            # Add header/footer to the main document BEFORE building content
+            # This ensures all content pages have header/footer
+            # The cover page (merged later) will not have header/footer
+            create_header_footer(doc, client_name, project_name, None, client_logo_path)
+            
+            # ==================== COVER LETTER (with header/footer) ====================
             if cover_letter_text:
                 build_cover_letter_section(doc, cover_letter_text)
             
-            # ==================== FRONT PAGE (NO HEADER) ====================
+            # ==================== FRONT PAGE (WITH HEADER) ====================
             if cover_letter_text:
-                build_front_page_section(doc, project_name, offer_ref, contact_name, contact_email, contact_phone, layout_image)
+                build_front_page_section(doc, project_name, offer_ref, contact_name, contact_email, contact_phone, layout_png_path)
             
-            # ==================== NOW ADD HEADER/FOOTER FOR ALL REMAINING SECTIONS ====================
-            create_header_footer(doc, client_name, project_name, None, client_logo_path)
-            
-            # ==================== GLOSSARY ====================
-            build_glossary_section(doc)
+            # ==================== TABLE OF CONTENTS ====================
+            build_table_of_contents_section(doc)
             
             # Start numbering from 1
             counter = 1
@@ -3063,89 +5719,411 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             if include_exec_summary and exec_summary_text:
                 build_executive_summary_section(doc, exec_summary_text, counter)
                 counter += 1
-
+            
             # 2. Company Profile
             if include_company_profile:
                 build_company_profile_section(doc, counter)
                 counter += 1
 
-            # 3. Reference Projects
-            if include_ref_projects:
-                build_reference_projects_section(doc, counter)
-                counter += 1
-
-            # 4. Handled Shipment Spectrum
+            # 3. Handled Shipment Spectrum
             if include_handled_spectrum:
                 build_handled_spectrum_section(doc, counter, project_name, client_name)
                 counter += 1
 
-            # 4b. Capacity Calculations Section
+            # 4. Proposed System Description
+            if include_proposed_system and process_flow_text:
+                build_proposed_system_description_section(doc, counter, client_name, project_name, 
+                                                         process_flow_text, layout_png_path)
+                counter += 1
+            
+            # 4.1 System Description (Detailed)
+            if include_proposed_system and system_description_text:
+                build_system_description_section(doc, counter, system_description_text)
+                counter += 1
+            
+            # 4.2 Description of Components (from Loop CBS Excel if available)
+            sorter_spec = None
+            if costing_file is not None:
+                try:
+                    sheet_name, df = load_loop_cbs_sheet_from_excel(costing_file.getvalue())
+                    if sheet_name and df is not None:
+                        sheet_text = df_to_compact_text(df)
+                        sorter_spec = call_groq_for_sorter_spec(sheet_name, sheet_text)
+                        if sorter_spec:
+                            st.success("✓ Extracted sorter specifications from Loop CBS sheet")
+                except Exception as e:
+                    st.warning(f"Could not extract Loop CBS data for component description: {e}")
+            
+            build_description_of_components_section(doc, counter, sorter_spec)
+            counter += 1
+            
+            # 5. Proposed System Technical Details (from Quote Master Excel if available)
+            bom_json = None
+            if costing_file is not None:
+                try:
+                    # Load Quote Master sheet from costing file
+                    with pd.ExcelFile(io.BytesIO(costing_file.getvalue())) as xls:
+                        quote_master_sheet = None
+                        for sheet in xls.sheet_names:
+                            if sheet.lower().strip() == "quote master":
+                                quote_master_sheet = sheet
+                                break
+                        
+                        if quote_master_sheet:
+                            df_quote = pd.read_excel(xls, sheet_name=quote_master_sheet)
+                            sheet_text = df_to_compact_text_quote_master(df_quote)
+                            bom_json = call_groq_for_bom(sheet_text)
+                            if bom_json:
+                                st.success("✓ Generated Proposed System Technical Details from Quote Master")
+                        else:
+                            st.info("ℹ️ Quote Master sheet not found in costing file - skipping technical details section")
+                except Exception as e:
+                    st.warning(f"Could not extract Quote Master data: {e}")
+            
+            if bom_json:
+                build_proposed_system_technical_details_section(doc, counter, bom_json)
+                counter += 1
+            
+            # 6. Concept Description
+            if include_concept_desc and flowchart_png_bytes:
+                build_concept_description_section(doc, counter, flowchart_png_bytes)
+                counter += 1
+
+            # 7. Capacity Calculations Section (optional)
             if include_capacity_section and capacity_excel is not None:
                 build_capacity_calculations_section(doc, counter, client_name, project_name, capacity_excel)
                 counter += 1
 
-            # 5. Electrical System
+            # 8. Electrical System
             if elec_include:
                 build_electrical_section(doc, counter)
                 counter += 1
             
-            # 6. Falcon WCS CONTROLIT
+            # 9. Falcon WCS CONTROLIT
             if wcs_include:
                 build_wcs_section(doc, counter, client_name)
                 counter += 1
             
-            # 7. Falcon Visual Inspection System (SCADA)
+            # 10. Falcon Visual Inspection System (SCADA)
             if scada_include:
                 build_scada_section(doc, counter, client_name)
                 counter += 1
             
-            # 8. Key Components Make
+            # 11. Key Components Make
             if key_include:
                 build_key_components_section(doc, counter, key_components_edited)
                 counter += 1
             
-            # 9. Principal of Safety
+            # 12. Principal of Safety
             if safety_include:
                 build_safety_section(doc, counter)
                 counter += 1
             
-            # 10. Infrastructure
+            # 13. Infrastructure
             if infra_include:
                 build_infrastructure_section(doc, counter)
                 counter += 1
             
-            # 11. Program Organisation
+            # 14. Program Organisation
             if prog_include:
                 build_program_org_section(doc, counter, client_name, prog_gantt)
                 counter += 1
             
-            # 12. Client Responsibility
+            # 15. Client Responsibility
             if client_resp_include:
                 build_client_responsibility_section(doc, counter, client_name)
                 counter += 1
             
-            # 13. System Handover
+            # 16. System Handover
             if handover_include:
                 build_handover_section(doc, counter)
                 counter += 1
             
-            # 14. Commercial
+            # 17. Commercial
             if commercial_include:
                 build_commercial_section(doc, counter, price_data, payment_terms_data, bca_discount)
                 counter += 1
             
-            # 15. Warranty Period
+            # 18. Warranty Period
             if warranty_include:
                 build_warranty_section(doc, counter, warranty_type, warranty_duration, 
                                       warranty_start, warranty_extended_text, 
                                       warranty_amc_text, warranty_transport_text)
                 counter += 1
             
-            # 16. Exclusions
+            # 19. Exclusions
             if exclusion_include:
                 build_exclusions_section(doc, counter, selected_exclusions)
                 counter += 1
             
+            # ==================== EXTRACT GLOSSARY TERMS FROM COMPLETE DOCUMENT ====================
+            st.info("🔍 Scanning document for glossary terms...")
+            
+            # Save document to buffer to extract text
+            temp_buffer = io.BytesIO()
+            doc.save(temp_buffer)
+            temp_buffer.seek(0)
+            
+            # Load document and extract all text
+            temp_doc = Document(temp_buffer)
+            full_text = extract_full_text_from_docx(temp_doc)
+            
+            # Find terms that appear in the document
+            detected_terms = find_terms_in_text(full_text)
+            
+            if detected_terms:
+                st.success(f"✓ Found {len(detected_terms)} glossary terms in the document")
+                
+                # Now we need to insert glossary BEFORE Executive Summary
+                # We'll create a new document with proper section order
+                
+                # Save current document to buffer
+                current_doc_buffer = io.BytesIO()
+                doc.save(current_doc_buffer)
+                current_doc_buffer.seek(0)
+                
+                # Load it back
+                doc = Document(current_doc_buffer)
+                
+                # Create new document with glossary inserted before Executive Summary
+                new_doc = Document()
+                ensure_list_styles(new_doc)
+                
+                # Set default font
+                style = new_doc.styles['Normal']
+                font = style.font
+                font.name = 'Calibri (Body)'
+                font.size = Pt(11)
+                
+                # Add header/footer to new document
+                create_header_footer(new_doc, client_name, project_name, None, client_logo_path)
+                
+                # Copy all content up to (but not including) Executive Summary
+                # Then insert Glossary, then copy rest
+                
+                # For simplicity, we'll insert glossary sections at the correct position
+                # by tracking when we hit the Executive Summary heading
+                
+                exec_summary_found = False
+                glossary_inserted = False
+                
+                for element in doc.element.body:
+                    # Check if this is the Executive Summary paragraph
+                    if element.tag.endswith('p'):
+                        para_text = ''.join([t.text for t in element.xpath('.//w:t', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})])
+                        
+                        # If we find "Executive Summary" or "1. Executive Summary", insert glossary before it
+                        if not glossary_inserted and ('Executive Summary' in para_text or 'EXECUTIVE SUMMARY' in para_text.upper()):
+                            # Insert glossary here
+                            build_glossary_section(new_doc, detected_terms)
+                            glossary_inserted = True
+                    
+                    # Copy the element to new document
+                    new_doc.element.body.append(element)
+                
+                # If glossary wasn't inserted (Executive Summary not found), add it at the beginning
+                if not glossary_inserted:
+                    st.warning("Could not locate Executive Summary section - glossary added at beginning")
+                    # Create a temporary doc with glossary
+                    temp_glossary_doc = Document()
+                    build_glossary_section(temp_glossary_doc, detected_terms)
+                    # Insert at beginning of new_doc
+                    for element in temp_glossary_doc.element.body:
+                        new_doc.element.body.insert(0, element)
+                
+                doc = new_doc
+            else:
+                st.info("ℹ️ No glossary terms detected in the document")
+            
+            # ==================== INSERT COVER PAGE AT BEGINNING ====================
+            # Now prepend cover page at the beginning if cover letter was generated
+            if cover_letter_text:
+                try:
+                    # Get client logo bytes for cover page
+                    cover_client_logo_bytes = None
+                    if client_logo_path and os.path.exists(client_logo_path):
+                        with open(client_logo_path, "rb") as f:
+                            cover_client_logo_bytes = f.read()
+                    
+                    # Create cover page using template
+                    cover_page_buffer = create_cover_page(
+                        client_logo=cover_client_logo_bytes,
+                        client_name=client_name,
+                        project_title=project_name
+                    )
+                    
+                    # Save main document to temp buffer
+                    temp_main_buffer = io.BytesIO()
+                    doc.save(temp_main_buffer)
+                    temp_main_buffer.seek(0)
+                    
+                    # Load cover page document (from template)
+                    cover_doc = Document(cover_page_buffer)
+                    
+                    # Load main content document (all our generated content with images)
+                    main_doc = Document(temp_main_buffer)
+                    
+                    # Try using Composer for proper merge (preserves all relationships including images)
+                    try:
+                        composer = Composer(cover_doc)
+                        composer.append(main_doc)
+                        
+                        # Save composed document
+
+                        composed_buffer = io.BytesIO()
+                        composer.save(composed_buffer)
+                        composed_buffer.seek(0)
+                        # Load as final document
+                        doc = Document(composed_buffer)
+
+                    except (ImportError, NameError, AttributeError):
+                        # Fallback: If Composer not available, use element insertion
+                        cover_elements = []
+                        for element in cover_doc.element.body:
+                            if element.tag.endswith('sectPr'):
+                                continue
+                            cover_elements.append(element)
+                        for i, element in enumerate(cover_elements):
+                            main_doc.element.body.insert(i, element)
+                        page_break_xml = '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:br w:type="page"/></w:r></w:p>'
+                        page_break_element = parse_xml(page_break_xml)
+                        main_doc.element.body.insert(len(cover_elements), page_break_element)
+                        doc = main_doc
+
+                except Exception as e:
+                    st.warning(f"Could not insert cover page: {str(e)}. Cover page will be skipped.")
+
+            # === Add header/footer to all sections except cover page ===
+            try:
+                # Only add header/footer to sections after the first (cover page)
+                for i, section in enumerate(doc.sections):
+                    if i == 0:
+                        continue  # Skip cover page section
+                    # Use fixed Falcon logo path
+                    falcon_logo_path = "FIXED_IMAGE\\Falcon-Autotech_Logo-removebg-preview.png"
+                    # Use client logo path if available
+                    client_logo_path_to_use = client_logo_path if client_logo_path and os.path.exists(client_logo_path) else None
+                    # Set margins
+                    section.top_margin = Inches(1.0)
+                    section.bottom_margin = Inches(1.0)
+                    section.left_margin = Inches(1.0)
+                    section.right_margin = Inches(1.0)
+                    # HEADER
+                    header = section.header
+                    header.is_linked_to_previous = False
+                    header_table = header.add_table(rows=1, cols=3, width=Inches(6.5))
+                    header_table.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    # Left cell - Client Logo
+                    left_cell = header_table.rows[0].cells[0]
+                    left_cell.width = Inches(1.3)
+                    left_cell.vertical_alignment = 1
+                    if client_logo_path_to_use and os.path.exists(client_logo_path_to_use):
+                        left_para = left_cell.paragraphs[0]
+                        left_run = left_para.add_run()
+                        left_run.add_picture(client_logo_path_to_use, height=Inches(0.6))
+                        left_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    # Middle cell - Header Text
+                    middle_cell = header_table.rows[0].cells[1]
+                    middle_cell.width = Inches(4.0)
+                    middle_cell.vertical_alignment = 1
+                    middle_para = middle_cell.paragraphs[0]
+                    middle_run = middle_para.add_run(f"FALCON's Proposal to {client_name} for the {project_name}")
+                    middle_run.font.name = 'Calibri'
+                    middle_run.font.size = Pt(9)
+                    middle_run.font.bold = False
+                    middle_run.font.color.rgb = RGBColor(81, 120, 183)
+                    middle_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    # Right cell - Falcon Logo
+                    right_cell = header_table.rows[0].cells[2]
+                    right_cell.width = Inches(1.3)
+                    right_cell.vertical_alignment = 1
+                    if os.path.exists(falcon_logo_path):
+                        right_para = right_cell.paragraphs[0]
+                        right_run = right_para.add_run()
+                        right_run.add_picture(falcon_logo_path, height=Inches(0.6))
+                        right_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    # Remove borders from header table
+                    for row in header_table.rows:
+                        for cell in row.cells:
+                            tc = cell._element
+                            tcPr = tc.get_or_add_tcPr()
+                            tcBorders = OxmlElement('w:tcBorders')
+                            for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+                                border = OxmlElement(f'w:{border_name}')
+                                border.set(qn('w:val'), 'none')
+                                tcBorders.append(border)
+                            tcPr.append(tcBorders)
+                    # Add horizontal line after header
+                    header_line = header.add_paragraph()
+                    header_line_run = header_line.add_run()
+                    header_line.paragraph_format.space_before = Pt(3)
+                    # FOOTER
+                    footer = section.footer
+                    footer.paragraphs.clear()
+                    footer_line = footer.add_paragraph()
+                    footer_line_run = footer_line.add_run()
+                    footer_line.paragraph_format.space_after = Pt(3)
+                    para = footer.add_paragraph()
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    run = para.add_run("© FALCON AUTOTECH 2025 Confidential: Not for Distribution. ")
+                    run.font.name = 'Calibri (Body)'
+                    run.font.size = Pt(9)
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+                    # Add hyperlink
+                    part = para.part
+                    r_id = part.relate_to("https://www.falconautotech.com/", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
+                    hyperlink = OxmlElement('w:hyperlink')
+                    hyperlink.set(qn('r:id'), r_id)
+                    new_run = OxmlElement('w:r')
+                    rPr = OxmlElement('w:rPr')
+                    color = OxmlElement('w:color')
+                    color.set(qn('w:val'), '0563C1')
+                    rPr.append(color)
+                    u = OxmlElement('w:u')
+                    u.set(qn('w:val'), 'single')
+                    rPr.append(u)
+                    rFonts = OxmlElement('w:rFonts')
+                    rFonts.set(qn('w:ascii'), 'Calibri (Body)')
+                    rPr.append(rFonts)
+                    sz = OxmlElement('w:sz')
+                    sz.set(qn('w:val'), '18')
+                    rPr.append(sz)
+                    new_run.append(rPr)
+                    new_run.text = "https://www.falconautotech.com/"
+                    hyperlink.append(new_run)
+                    para._p.append(hyperlink)
+                    run2 = para.add_run(" | Page ")
+                    run2.font.name = 'Calibri (Body)'
+                    run2.font.size = Pt(9)
+                    run2.font.color.rgb = RGBColor(0, 0, 0)
+                    # Add page number field
+                    fldChar1 = OxmlElement('w:fldChar')
+                    fldChar1.set(qn('w:fldCharType'), 'begin')
+                    instrText = OxmlElement('w:instrText')
+                    instrText.set(qn('xml:space'), 'preserve')
+                    instrText.text = 'PAGE'
+                    fldChar2 = OxmlElement('w:fldChar')
+                    fldChar2.set(qn('w:fldCharType'), 'end')
+                    run2._r.append(fldChar1)
+                    run2._r.append(instrText)
+                    run2._r.append(fldChar2)
+                    run3 = para.add_run(" of ")
+                    run3.font.name = 'Calibri (Body)'
+                    run3.font.size = Pt(9)
+                    run3.font.color.rgb = RGBColor(0, 0, 0)
+                    fldChar3 = OxmlElement('w:fldChar')
+                    fldChar3.set(qn('w:fldCharType'), 'begin')
+                    instrText2 = OxmlElement('w:instrText')
+                    instrText2.set(qn('xml:space'), 'preserve')
+                    instrText2.text = 'NUMPAGES'
+                    fldChar4 = OxmlElement('w:fldChar')
+                    fldChar4.set(qn('w:fldCharType'), 'end')
+                    run3._r.append(fldChar3)
+                    run3._r.append(instrText2)
+                    run3._r.append(fldChar4)
+            except Exception as e:
+                st.warning(f"Could not add header/footer: {str(e)}")
+
             # Save to buffer
             buffer = BytesIO()
             doc.save(buffer)
@@ -3176,6 +6154,3 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                     os.remove(client_logo_path)
             except:
                 pass
-
-st.markdown("---")
-st.info("💡 **Tip:** Make sure all required images are present in the FIXED_IMAGE folder before generating the document.")
