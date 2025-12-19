@@ -1,0 +1,29 @@
+{
+  "process_flow_feedback_rules": [
+    {
+      "id": "rule_001",
+      "timestamp": "2025-12-03T15:42:54.407812",
+      "user_feedback": "Divide the the whole process flow in more highlevel. No need to mention the components scintific names like FA_FS003V etc. \nIt should start with a Infeed lines then induction zone and then main loop CBS. ",
+      "rule": "**High‑Level Process Flow (No Scientific Component Names)**  \n\nBelow is a concise, high‑level description of the entire process, organized exactly as you requested:  \n\n---\n\n### 1. Infeed Lines  \n**Purpose:** Bring raw material (or feedstock) into the system.  \n**Key Activities:**  \n- **Material Reception:** Unload and stage incoming material.  \n- **Pre‑Screening / Sorting:** Remove obvious contaminants and sort by size or type.  \n- **Conveyance to Induction Zone:** Use belts, rollers, or pneumatic lines to transport the material to the next stage.  \n\n*Why we keep this level:*  \n- It captures the essential function (bringing material into the plant) without getting bogged down in the details of individual sensors, actuators, or part numbers.  \n\n---\n\n### 2. Induction Zone  \n**Purpose:** Prepare the material for the main processing loop by conditioning, aligning, or pre‑treating it.  \n**Key Activities:**  \n- **Conditioning (e.g., heating, cooling, drying):** Bring the material to the required temperature or moisture level.  \n- **Alignment / Positioning:** Use guides or magnetic/optical systems to ensure the material is correctly oriented for downstream processing.  \n- **Quality Check (basic):** Verify that the material meets the minimum criteria for entry into the main loop (size, shape, temperature, etc.).  \n\n*Why we keep this level:*  \n- The induction zone is a distinct functional block that bridges raw feed and the core processing loop. Describing it as a single “zone” makes the flow easier to follow while still highlighting its critical preparatory role.  \n\n---\n\n### 3. Main Loop – CBS (Closed‑Loop Control System)  \n**Purpose:** Perform the core processing steps, continuously monitoring and adjusting parameters to maintain product quality and throughput.  \n**Key Activities (high‑level):**  \n- **Primary Processing:** The core operation (e.g., cutting, forming, coating, chemical reaction) that transforms the conditioned material into the target product.  \n- **Closed‑Loop Monitoring:** Sensors feed real‑time data to a control algorithm that automatically adjusts actuators (speed, temperature, pressure, etc.) to keep the process within spec.  \n- **Intermediate Quality Checks:** Periodic inspections or measurements that feed back into the control loop for fine‑tuning.  \n- **Product Extraction / Transfer:** Once processing is complete, the product is moved out of the loop to downstream handling (packaging, storage, etc.).  \n\n*Why we keep this level:*  \n- By labeling the entire core as the “Main Loop (CBS)”, we emphasize that it is a self‑regulating system without enumerating each individual component (e.g., FA_FS003V). This keeps the description clean, focused on function, and easier for non‑technical stakeholders to understand.  \n\n---\n\n## Reasoning Behind This Structure  \n\n1. **Clarity & Readability** – Removing specific part numbers (FA_FS003V, etc.) eliminates unnecessary jargon, making the flow understandable to a broader audience (operators, managers, auditors).  \n2. **Functional Grouping** – Grouping steps into three logical blocks (Infeed → Induction → Main Loop) mirrors how the plant is actually organized on the floor, helping readers visualize the physical layout.  \n3. **Scalability** – If new sub‑processes are added later (e.g., an extra conditioning step), they can be inserted within the appropriate high‑level block without reshaping the entire diagram.  \n4. **Focus on Control Logic** – Highlighting the Closed‑Loop Control System (CBS) at the core underscores the importance of automation and feedback, which is the primary driver of product quality and efficiency.  \n\n---\n\n### Quick Reference Diagram (Textual)\n\n```\n[Infeed Lines] → [Induction Zone] → [Main Loop – CBS] → [Downstream Handling]\n```\n\nEach bracket represents a high‑level functional stage; the arrows indicate material flow.  \n\n---\n\n**Result:** A streamlined, high‑level process flow that starts with Infeed lines, proceeds through an Induction zone, and culminates in the Main Loop (CBS), all without referencing specific scientific component names.",
+      "applied_to_projects": [
+        "Automated Sorting System"
+      ],
+      "active": true
+    },
+    {
+      "id": "rule_002",
+      "timestamp": "2025-12-03T16:05:25.083493",
+      "user_feedback": "Give 4-5 pointers highlighting the main components and remove any sci-fi name of components like FA-0032V etc",
+      "rule": "**Key components to focus on (without sci‑fi identifiers):**\n\n1. **Power Supply** – Provides stable voltage and current to all parts of the system.  \n2. **Processing Unit** – Executes core logic, calculations, and control algorithms.  \n3. **Memory & Storage** – Holds temporary data for fast access (RAM) and permanent data (SSD/HDD).  \n4. **Input/Output Interfaces** – Connects the system to external devices (USB, Ethernet, display, sensors).  \n5. **Thermal Management** – Keeps temperature within safe limits using heatsinks, fans, or liquid cooling.",
+      "applied_to_projects": [
+        "Automated Sorting System"
+      ],
+      "active": true
+    }
+  ],
+  "metadata": {
+    "last_updated": "2025-12-03T16:05:25.083493",
+    "total_rules": 2,
+    "version": "1.0"
+  }
+}
