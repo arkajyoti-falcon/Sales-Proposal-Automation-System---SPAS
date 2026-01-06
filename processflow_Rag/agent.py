@@ -26,7 +26,6 @@ from combine_old import (
     get_pinecone_index,
     query_similar_flows,
     call_groq,
-    get_cbs_knowledge,
 )
 from dxf_extractor import create_dxf_summary_for_embedding
 
@@ -237,13 +236,10 @@ def generate_initial_flow(client_name: str, dxf_json: dict) -> str:
     """Step 1: Generate initial flow from DXF data only."""
     
     dxf_summary = create_dxf_summary(dxf_json)
-    cbs_knowledge = get_cbs_knowledge()
     
     system_prompt = """## ROLE
 You are a senior solution engineer writing the "Process Flow of the System" section for Cross-Belt Sorter (CBS) proposals. Your output must **exactly match** the style, structure, and content depth of professional CBS proposals while strictly adhering to provided data.
 
----
-**ABOUT CROSS BELT SORTERS (CBS):** {cbs_knowledge}
 ---
 
 ## 🚨 CRITICAL FORMATTING RULES (NON-NEGOTIABLE)

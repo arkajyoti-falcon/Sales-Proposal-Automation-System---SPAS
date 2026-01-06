@@ -5,6 +5,8 @@ import streamlit as st
 import pandas as pd
 import json
 import re
+import string
+from typing import Any, Dict, List, Optional, Tuple
 import base64
 import copy
 import tempfile
@@ -29,26 +31,22 @@ from dotenv import load_dotenv
 from docxcompose.composer import Composer
 import pdfplumber
 import ezdxf
+import openpyxl
 import requests
 import convertapi
 import sys
 from sentence_transformers import SentenceTransformer, util as st_util
 from bert_score import score as bert_score
-from Supportive_Functions.feedback_manager import (
-    load_feedback_rules,
-    save_feedback_rule,
-    get_all_rules,
-    deactivate_rule,
-    update_rule,
-    create_local_rule,
-    get_rule_stats
-)
+# Feedback rules management removed: functionality deprecated/disabled
 
 load_dotenv()
 
 # Import the standalone system-description module (we will reuse its deterministic
 # DXF/costing extraction + GROQ prompt flow to produce the System Description)
-import sys_desc_latest as sd_sys
+import st_sys_desc as sd_sys
+
+# Import BOM generation functions from bom.py for Mechanical equipment
+import bom as bom_module
 
 # Ensure processflow_Rag modules are importable
 sys.path.append(str(Path(__file__).parent / "processflow_Rag"))
@@ -60,9 +58,10 @@ from agentY import (
     generate_initial_flow as agentY_generate_initial_flow,
     generate_second_flow_with_chunks,
     iterative_refinement,
-    clean_generated_flow as agentY_clean_generated_flow,
-    validate_flow_quality as agentY_validate_flow_quality,
-    evaluate_process_flow as agentY_evaluate_process_flow
+    clean_generated_flow ,
+    validate_flow_quality,
+    evaluate_process_flow as agentY_evaluate_process_flow,
+    fix_empty_output_chutes as agentY_fix_empty_output_chutes
 )
 
 import torch
@@ -656,6 +655,134 @@ def call_groq_with_retry(api_call_func, max_retries=5, initial_delay=2):
     
     raise RuntimeError(f"Failed after {max_retries} retries")
 
+
+# ==================== TEXT NORMALIZATION UTILITIES ====================
+def normalize_cross_belt_sorter(text: str) -> str:
+    """
+    Normalize all variations of 'Cross belt sorter' to 'Cross Belt Sorter'.
+    Handles case variations like 'cross belt sorter', 'Cross belt Sorter', etc.
+    """
+    if not text:
+        return text
+    # Use regex to find all case variations and replace with proper capitalization
+    pattern = re.compile(r'cross[\s-]*belt[\s-]*sorter', re.IGNORECASE)
+    return pattern.sub('Cross Belt Sorter', text)
+
+
+# Known client names from reference proposals that might appear in chunks
+KNOWN_REFERENCE_CLIENTS = [
+    "Amazon", "Noon", "Shadowfax", "Bosta", "Delhivery", "Flipkart",
+    "Aramex", "Asendia", "Fastway", "Ekart", "BlueDart", "DTDC",
+    "XpressBees", "Ecom Express", "Gati", "Rivigo", "FedEx", "DHL",
+    "Ecom", "Xpressbees", "Blue Dart", "Express", "Flipkart India"
+]
+
+def replace_client_names_in_flow(text: str, correct_client_name: str) -> str:
+    """
+    Replace any reference client names with the correct user-provided client name.
+    This ensures consistency when process flows are generated using reference chunks
+    from previous proposals.
+    
+    Enhanced with comprehensive pattern matching to catch all client name mentions.
+    """
+    if not text or not correct_client_name:
+        return text
+    
+    result = text
+    correct_client_lower = correct_client_name.lower().strip()
+    
+    for ref_client in KNOWN_REFERENCE_CLIENTS:
+        # Skip if the reference client IS the correct client (case-insensitive)
+        if ref_client.lower() == correct_client_lower:
+            continue
+        
+        # Skip if reference client is a substring of correct client or vice versa
+        if ref_client.lower() in correct_client_lower or correct_client_lower in ref_client.lower():
+            continue
+        
+        # Pattern 1: "[Client]'s sorting logic" or "[Client] sorting logic"
+        pattern1 = re.compile(
+            rf"\b{re.escape(ref_client)}(?:'s|'s|s)?\s+sorting\s+logic",
+            re.IGNORECASE
+        )
+        result = pattern1.sub(f"{correct_client_name}'s sorting logic", result)
+        
+        # Pattern 2: "data provided by [Client]" or "provided by [Client]"
+        pattern2 = re.compile(
+            rf"provided\s+by\s+{re.escape(ref_client)}(?:'s|'s)?",
+            re.IGNORECASE
+        )
+        result = pattern2.sub(f"provided by {correct_client_name}", result)
+        
+        # Pattern 3: Direct client name mention in sorting context
+        pattern3 = re.compile(
+            rf"utilizing.*?{re.escape(ref_client)}(?:'s|'s)?\s+(?:sorting|logic|data)",
+            re.IGNORECASE
+        )
+        result = pattern3.sub(f"utilizing {correct_client_name}'s sorting logic", result)
+        
+        # Pattern 4: "[Client]'s WCS" or "WCS from [Client]" or "[Client] WCS"
+        pattern4 = re.compile(
+            rf"\b{re.escape(ref_client)}(?:'s|'s)?\s+(?:WCS|WMS|ERP|system)",
+            re.IGNORECASE
+        )
+        result = pattern4.sub(f"{correct_client_name}'s \\g<0>".replace(ref_client, correct_client_name), result)
+        result = re.sub(
+            rf"\b{re.escape(ref_client)}(?:'s|'s)?\s+(WCS|WMS|ERP|system)",
+            rf"{correct_client_name}'s \1",
+            result,
+            flags=re.IGNORECASE
+        )
+        
+        # Pattern 5: "data from [Client]" or "information from [Client]"
+        pattern5 = re.compile(
+            rf"(?:data|information|instructions?|commands?)\s+(?:from|by)\s+{re.escape(ref_client)}(?:'s|'s)?",
+            re.IGNORECASE
+        )
+        result = pattern5.sub(lambda m: m.group(0).replace(ref_client, correct_client_name).replace(ref_client.lower(), correct_client_name), result)
+        
+        # Pattern 6: "using [Client]'s data" or "using [Client] data"
+        pattern6 = re.compile(
+            rf"using\s+{re.escape(ref_client)}(?:'s|'s)?\s+(?:data|logic|system)",
+            re.IGNORECASE
+        )
+        result = pattern6.sub(f"using {correct_client_name}'s data", result)
+        
+        # Pattern 7: Generic "[Client]'s [something]" pattern - be careful, only in sorting/logistics context
+        pattern7 = re.compile(
+            rf"\b{re.escape(ref_client)}(?:'s|'s)\s+(?:sorting|warehouse|logistics|fulfillment|distribution)",
+            re.IGNORECASE
+        )
+        result = pattern7.sub(lambda m: m.group(0).replace(ref_client, correct_client_name), result)
+        
+        # Pattern 8: Standalone client name after "by" in context of data/sorting
+        pattern8 = re.compile(
+            rf"(?:sorted|processed|handled|managed|controlled)\s+by\s+{re.escape(ref_client)}",
+            re.IGNORECASE
+        )
+        result = pattern8.sub(lambda m: m.group(0).replace(ref_client, correct_client_name), result)
+    
+    return result
+
+
+def normalize_proposal_text(text: str, client_name: str = None) -> str:
+    """
+    Apply all text normalizations to proposal content:
+    1. Normalize 'Cross Belt Sorter' capitalization
+    2. Replace reference client names with correct client name
+    """
+    if not text:
+        return text
+    
+    # Apply Cross Belt Sorter normalization
+    result = normalize_cross_belt_sorter(text)
+    
+    # Apply client name replacement if provided
+    if client_name:
+        result = replace_client_names_in_flow(result, client_name)
+    
+    return result
+
 # ==================== DXF COMPONENT EXTRACTION ====================
 
 UNITS = {
@@ -673,8 +800,11 @@ COMPONENT_PATTERNS = {
         r"telescopic", r"infeed.*conv", r"in.*feed", r"receiving.*conv",
         r"inclined.*conv", r"incline", r"elevation.*conv"
     ],
+    "ALIGNING_CONVEYOR": [
+        r"aligning", r"align.*conv", r"alignment"
+    ],
     "VDS_BUFFER": [
-        r"vds", r"distribution.*loop", r"buffer", r"arm.*vds"
+        r"vds", r"distribution.*loop", r"arm.*vds", r"boom.*conv", r"boom"
     ],
     "OPERATOR_STATION": [
         r"operator(?!.*safety)", r"manual.*station", r"induct.*station"
@@ -682,13 +812,25 @@ COMPONENT_PATTERNS = {
     "CHUTE": [
         r"^chute", r"gravity.*chute", r"live.*chute", r"slide.*chute",
         r"sliding.*chute", r"reject.*chute", r"collection.*chute",
-        r"mini.*chute", r"bulk.*chute", r"discharge"
+        r"mini.*chute", r"bulk.*chute", r"discharge", r"direct.*bagging", r"bagging.*chute"
+    ],
+    "NON_SORT_CHUTE": [
+        r"big.*parcel.*chute", r"large.*parcel.*chute", r"non.*sort.*chute", 
+        r"nonsort.*chute", r"oversize.*chute", r"big.*chute"
+    ],
+    "REJECTION_CHUTE": [
+        r"irregular.*chute", r"irchute", r"reject.*chute", r"ir.*chute",
+        r"exception.*chute", r"error.*chute"
+    ],
+    "SLIDING_CHUTE": [
+        r"sliding.*chute", r"slide.*chute", r"ptl.*rack", r"ptl\s*\d+x\d+"
     ],
     "PTL": [
         r"ptl", r"put.*to.*light", r"pick.*to.*light", r"light.*rack"
     ],
     "BAG_SYSTEM": [
-        r"bag.*conv", r"bag.*takeaway", r"bagging"
+        r"bag.*conv", r"bag.*takeaway", r"takeaway.*conv", r"bag.*take.*away",
+        r"bagging.*conv", r"bag.*belt", r"^a\$[a-z0-9]+$"  # A$ blocks are Bag Takeaway Conveyors
     ],
     "RECIRCULATION": [
         r"recirculation", r"recirculate", r"refeed", r"return.*conv"
@@ -701,6 +843,12 @@ COMPONENT_PATTERNS = {
         r"scanner", r"scan.*tunnel", r"barcode.*read", r"dimension.*sys",
         r"dws", r"volume.*scan"
     ],
+    "TROLLEY": [
+        r"trolley", r"roller.*cage", r"cage.*trolley"
+    ],
+    "COLLECTION_BIN": [
+        r"collection.*bin", r"bin.*fal", r"st001"
+    ],
 }
 
 # Structural components to filter out
@@ -712,12 +860,17 @@ STRUCTURAL_PATTERNS = [
 ]
 
 def _is_noise_block(name: str) -> bool:
-    """Filter out anonymous noise blocks."""
+    """Filter out anonymous noise blocks.
+    
+    Note: A$ blocks (like a$cf3a0ab4a) are NOT noise - they are Bag Takeaway Conveyors.
+    """
     n = name.strip()
     if re.match(r"^\*[UDXATE]\d+$", n, re.IGNORECASE):
         return True
     if n.startswith("*") or n.startswith("~"):
         return True
+    # A$ blocks are Bag Takeaway Conveyors - DO NOT filter them
+    # They will be categorized as BAG_SYSTEM
     return False
 
 def _is_structural(name: str) -> bool:
@@ -770,40 +923,137 @@ def _detect_cbs_type(project_name: str) -> str:
     return "Loop CBS"
 
 def _analyze_chute_types(components: dict) -> dict:
-    """Analyze chute breakdown by examining component names."""
+    """
+    Enhanced chute breakdown analysis from raw DXF block names.
+    
+    Key mappings:
+    - "big parcel chute" -> Non-Sort Chutes (large parcels)
+    - "irregular chute" / "irchute" -> Rejection Chutes
+    - "ptl rack" -> Sliding Chutes (PTL-enabled sliding chutes)
+    - "sliding chute" / "slide chute" -> Sliding Chutes
+    - "chute-XXX" generic pattern -> Generic Chutes
+    """
     chute_analysis = {
         "total": 0,
         "by_type": defaultdict(int),
-        "has_type_info": False
+        "has_type_info": False,
+        "per_zone": {}  # Will be populated if VDS count is known
     }
     
     for comp_name, count in components.items():
         name_lower = comp_name.lower()
-        if "chute" in name_lower:
+        
+        # Check for Non-Sort Chutes (big parcel chutes)
+        if "big" in name_lower and "parcel" in name_lower and "chute" in name_lower:
+            chute_analysis["by_type"]["non_sort_chutes"] += count
             chute_analysis["total"] += count
+            chute_analysis["has_type_info"] = True
+            continue
+        
+        # Check for Rejection/Irregular Chutes
+        if "irregular" in name_lower or "irchute" in name_lower:
+            chute_analysis["by_type"]["rejection_chutes"] += count
+            chute_analysis["total"] += count
+            chute_analysis["has_type_info"] = True
+            continue
+        
+        # Check for PTL Racks -> These are Sliding Chutes (PTL-enabled sliding chutes for bagging)
+        if "ptl" in name_lower and ("rack" in name_lower or re.search(r"ptl\s*\d+x\d+", name_lower)):
+            chute_analysis["by_type"]["sliding_chutes"] += count
+            chute_analysis["total"] += count
+            chute_analysis["has_type_info"] = True
+            continue
+        
+        # Only process remaining if "chute" or "bagging" is in the name
+        if "chute" not in name_lower and "bagging" not in name_lower:
+            continue
             
-            # Try to detect type
-            if "gravity" in name_lower or "collection" in name_lower:
-                chute_analysis["by_type"]["gravity"] += count
-                chute_analysis["has_type_info"] = True
-            elif "live" in name_lower or "active" in name_lower:
-                chute_analysis["by_type"]["live"] += count
-                chute_analysis["has_type_info"] = True
-            elif "slide" in name_lower or "sliding" in name_lower:
-                chute_analysis["by_type"]["sliding"] += count
-                chute_analysis["has_type_info"] = True
-            elif "reject" in name_lower or "exception" in name_lower:
-                chute_analysis["by_type"]["rejection"] += count
-                chute_analysis["has_type_info"] = True
-            elif "mini" in name_lower:
-                chute_analysis["by_type"]["mini_gravity"] += count
-                chute_analysis["has_type_info"] = True
-            elif "bulk" in name_lower:
-                chute_analysis["by_type"]["bulk"] += count
-                chute_analysis["has_type_info"] = True
-            elif "non-sort" in name_lower or "nonsort" in name_lower:
-                chute_analysis["by_type"]["non_sort"] += count
-                chute_analysis["has_type_info"] = True
+        chute_analysis["total"] += count
+        
+        # Try to detect type - check more specific patterns first
+        if "direct" in name_lower and "bagging" in name_lower:
+            chute_analysis["by_type"]["direct_bagging_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "bagging" in name_lower and "ptl" not in name_lower:
+            chute_analysis["by_type"]["direct_bagging_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "mini" in name_lower and "gravity" in name_lower:
+            chute_analysis["by_type"]["mini_gravity_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "gravity" in name_lower:
+            chute_analysis["by_type"]["gravity_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "collection" in name_lower:
+            chute_analysis["by_type"]["collection_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "live" in name_lower or "active" in name_lower or "ob live" in name_lower:
+            chute_analysis["by_type"]["live_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "slide" in name_lower or "sliding" in name_lower:
+            chute_analysis["by_type"]["sliding_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "reject" in name_lower or "exception" in name_lower:
+            chute_analysis["by_type"]["rejection_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "discharge" in name_lower:
+            chute_analysis["by_type"]["discharge_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "ow" in name_lower and "chute" in name_lower:
+            chute_analysis["by_type"]["ow_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "od" in name_lower and "chute" in name_lower:
+            chute_analysis["by_type"]["od_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "sort" in name_lower and "fail" in name_lower:
+            chute_analysis["by_type"]["sortfail_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "bulk" in name_lower:
+            chute_analysis["by_type"]["bulk_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "non-sort" in name_lower or "nonsort" in name_lower:
+            chute_analysis["by_type"]["non_sort_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "dispersion" in name_lower or "disperse" in name_lower:
+            chute_analysis["by_type"]["dispersion_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "high" in name_lower and "volume" in name_lower:
+            chute_analysis["by_type"]["high_volume_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "low" in name_lower and "volume" in name_lower:
+            chute_analysis["by_type"]["low_volume_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "manual" in name_lower:
+            chute_analysis["by_type"]["manual_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "spiral" in name_lower:
+            chute_analysis["by_type"]["spiral_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "overweight" in name_lower or "over" in name_lower:
+            chute_analysis["by_type"]["overweight_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        else:
+            # Generic chute if can't determine type
+            chute_analysis["by_type"]["generic_chutes"] += count
+    
+    return chute_analysis
+
+
+def _calculate_per_zone_chutes(chute_analysis: dict, vds_count: int) -> dict:
+    """
+    Calculate per-zone chute distribution when VDS count is known.
+    
+    Example: If VDS=2 and we have 26 non-sort chutes total,
+    then each zone has 13 non-sort chutes.
+    """
+    if vds_count <= 0:
+        return chute_analysis
+    
+    per_zone = {}
+    for chute_type, total_count in chute_analysis.get("by_type", {}).items():
+        per_zone[chute_type] = total_count // vds_count
+    
+    chute_analysis["per_zone"] = per_zone
+    chute_analysis["zone_count"] = vds_count
     
     return chute_analysis
 
@@ -854,6 +1104,23 @@ def extract_dxf_components(dxf_path: Path, project_name: str = "") -> dict:
     has_operators = len(categorized.get("OPERATOR_STATION", {})) > 0
     has_vds = len(categorized.get("VDS_BUFFER", {})) > 0
     
+    # Get VDS count for per-zone calculations
+    vds_count = 0
+    if has_vds:
+        vds_items = categorized.get("VDS_BUFFER", {})
+        vds_count = sum(item["count"] for item in vds_items.values())
+        if vds_count > 0:
+            chute_analysis = _calculate_per_zone_chutes(chute_analysis, vds_count)
+    
+    # Check for bag takeaway system
+    has_bag_system = len(categorized.get("BAG_SYSTEM", {})) > 0
+    # Also check in UNCATEGORIZED for bag-related items
+    uncategorized = categorized.get("UNCATEGORIZED", {})
+    for comp_name in uncategorized.keys():
+        if "bag" in comp_name.lower() and ("takeaway" in comp_name.lower() or "conv" in comp_name.lower()):
+            has_bag_system = True
+            break
+    
     if has_auto_induct and has_operators:
         induction_type = "MIXED (Auto + Manual)"
     elif has_auto_induct:
@@ -882,6 +1149,8 @@ def extract_dxf_components(dxf_path: Path, project_name: str = "") -> dict:
         "cbs_type": cbs_type,
         "induction_type": induction_type,
         "has_vds": has_vds,
+        "vds_count": vds_count,
+        "has_bag_system": has_bag_system,
         "total_components": total_components,
         "category_summary": dict(category_summary),
         "categorized_components": {
@@ -911,6 +1180,13 @@ def _summarise_components_for_prompt(dxf_json: dict) -> str:
     lines.append(f"  • Induction Type: {dxf_json.get('induction_type', 'Unknown')}")
     lines.append(f"  • VDS/Buffer System: {'YES' if dxf_json.get('has_vds') else 'NO'}")
     
+    vds_count = dxf_json.get('vds_count', 0)
+    if vds_count > 0:
+        lines.append(f"  • Number of VDS Zones: {vds_count}")
+    
+    has_bag_system = dxf_json.get('has_bag_system', False)
+    lines.append(f"  • Bag Takeaway System: {'YES' if has_bag_system else 'NO'}")
+    
     chute_analysis = dxf_json.get('chute_analysis', {})
     if chute_analysis.get('total', 0) > 0:
         lines.append(f"  • Total Chutes: {chute_analysis['total']}")
@@ -925,7 +1201,8 @@ def _summarise_components_for_prompt(dxf_json: dict) -> str:
     if cat_summary:
         lines.append("COMPONENT CATEGORIES:")
         priority = ["AUTO_INDUCT", "OPERATOR_STATION", "VDS_BUFFER", "CONVEYOR_INFEED",
-                   "CBS_SORTER", "CHUTE", "PTL", "BAG_SYSTEM", "RECIRCULATION", "SCANNER"]
+                   "CBS_SORTER", "CHUTE", "NON_SORT_CHUTE", "REJECTION_CHUTE", "SLIDING_CHUTE",
+                   "PTL", "BAG_SYSTEM", "RECIRCULATION", "SCANNER", "TROLLEY", "COLLECTION_BIN"]
         
         for cat in priority:
             if cat in cat_summary:
@@ -937,11 +1214,27 @@ def _summarise_components_for_prompt(dxf_json: dict) -> str:
                 lines.append(f"  • {cat}: {count} units")
         lines.append("")
     
-    # Chute breakdown
+    # Enhanced Chute breakdown with per-zone info
     if chute_analysis.get('by_type'):
-        lines.append("CHUTE TYPE BREAKDOWN:")
+        lines.append("=" * 70)
+        lines.append("CHUTE TYPE BREAKDOWN (CRITICAL - USE THESE EXACT COUNTS):")
+        lines.append("-" * 70)
+        
+        zone_count = chute_analysis.get('zone_count', 0)
+        per_zone = chute_analysis.get('per_zone', {})
+        
         for ctype, count in sorted(chute_analysis['by_type'].items(), key=lambda x: -x[1]):
-            lines.append(f"  • {ctype.replace('_', ' ').title()}: {count} chutes")
+            type_name = ctype.replace('_', ' ').title()
+            if zone_count > 0 and ctype in per_zone:
+                per_zone_count = per_zone[ctype]
+                lines.append(f"  • {type_name}: {count} total ({per_zone_count} per zone × {zone_count} zones)")
+            else:
+                lines.append(f"  • {type_name}: {count} chutes")
+        
+        if zone_count > 0:
+            lines.append("")
+            lines.append(f"⚠️ IMPORTANT: This system has {zone_count} VDS zones. Write chute counts PER ZONE in the output.")
+            lines.append("   Example: 'Within the loop CBS system, there are 50 Sliding chutes for each zone.'")
         lines.append("")
     
     # Detailed inventory by category
@@ -980,18 +1273,81 @@ def _summarise_components_for_prompt(dxf_json: dict) -> str:
         lines.append("  • Include Manual Induct Station section only")
     
     if chute_analysis.get('has_type_info'):
-        lines.append("  • Chute types available - use detailed breakdown")
+        lines.append("  • Chute types available - use detailed breakdown with per-zone counts")
     else:
         lines.append("  • Chute types NOT available - describe generically")
     
-    if "PTL" in cat_summary:
-        lines.append("  • Include Put To Light System section")
+    if "PTL" in cat_summary or "SLIDING_CHUTE" in cat_summary:
+        lines.append("  • Include PTL/Sliding Chutes with secondary sorting (bagging) description")
     
-    if "BAG_SYSTEM" in cat_summary:
-        lines.append("  • Include Bag Takeaway Conveyor section")
+    if has_bag_system or "BAG_SYSTEM" in cat_summary:
+        lines.append("  • ⚠️ MANDATORY: Include 'Bag Takeaway Conveyor' as FINAL SECTION (section 5)")
+        lines.append("    - BAG SYSTEM DETECTED in DXF - this section is REQUIRED")
+        lines.append("    - Describes conveyor beneath CBS that transports bags to Outbound sorter")
     
     if "RECIRCULATION" in cat_summary:
         lines.append("  • Include Recirculation/Exception Refeeding section")
+    
+    # Add detailed chute writing instructions
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("OUTPUT CHUTES SECTION - REQUIRED FORMAT:")
+    lines.append("-" * 70)
+    if chute_analysis.get('total', 0) > 0:
+        lines.append(f"TOTAL CHUTES: {chute_analysis['total']}")
+        if chute_analysis.get('by_type'):
+            lines.append("")
+            
+            zone_count = chute_analysis.get('zone_count', 0)
+            per_zone = chute_analysis.get('per_zone', {})
+            
+            # Show per-zone counts only if zone_count is 2 or 3 (i.e., 1 < zone_count < 4)
+            use_per_zone = 1 < zone_count < 4
+            
+            if use_per_zone:
+                lines.append(f"CHUTE BREAKDOWN TO INCLUDE IN OUTPUT (show PER-ZONE counts - {zone_count} zones):")
+            else:
+                lines.append("CHUTE BREAKDOWN TO INCLUDE IN OUTPUT (show TOTAL counts):")
+            
+            for ctype, count in sorted(chute_analysis['by_type'].items(), key=lambda x: -x[1]):
+                type_name = ctype.replace('_', ' ').title()
+                if use_per_zone and ctype in per_zone:
+                    lines.append(f"  - {type_name}: {per_zone[ctype]} per zone (total: {count})")
+                else:
+                    lines.append(f"  - {type_name}: {count}")
+            
+            lines.append("")
+            if use_per_zone:
+                lines.append(f"FORMAT EXAMPLE (for system with {zone_count} zones - use per-zone counts):")
+                lines.append("Output Chutes: - The shipments are discharged into following types of chutes:")
+                lines.append("a. Sliding Chutes - Within the loop CBS system, there are a total of 50 Sliding chutes for")
+                lines.append("   each zone. The Shipments collected in Roller Cage trolleys, then they are consolidated")
+                lines.append("   into bags using bagging type PTL racks.")
+                lines.append("b. Non-Sort Chutes - Within the loop CBS system, there are a total of 13 Non-Sort Chutes per zone.")
+                lines.append("   Shipments collected within these chutes further undergo sortation via PTL setup into Pallets.")
+                lines.append("c. Rejection Chutes - Two Rejection Chutes per zone are present to handle rejected Shipments.")
+            else:
+                lines.append("FORMAT EXAMPLE (use TOTAL counts):")
+                lines.append("Output Chutes: - The shipments are discharged into following types of chutes:")
+                lines.append("a. Sliding Chutes - Within the loop CBS system, there are a total of 100 Sliding chutes.")
+                lines.append("   The Shipments collected in Roller Cage trolleys, then they are consolidated into bags.")
+                lines.append("b. Non-Sort Chutes - Within the loop CBS system, there are a total of 26 Non-Sort Chutes.")
+                lines.append("c. Rejection Chutes - 4 Rejection Chutes are present to handle rejected Shipments.")
+        else:
+            lines.append("NO SPECIFIC CHUTE TYPES DETECTED - use generic description")
+    
+    # Bag Takeaway section guidance
+    if has_bag_system or "PTL" in cat_summary or "SLIDING_CHUTE" in cat_summary:
+        lines.append("")
+        lines.append("=" * 70)
+        lines.append("BAG TAKEAWAY CONVEYOR SECTION (REQUIRED AS FINAL SECTION):")
+        lines.append("-" * 70)
+        lines.append("⚠️ BAG SYSTEM DETECTED - MUST include this section AFTER Output Chutes!")
+        lines.append("FORMAT EXAMPLE:")
+        lines.append("Bag Takeaway Conveyor: - Following the direct bagging process & secondary sorting process,")
+        lines.append("   the shipments are placed into bags and then manually loaded onto a bag takeaway conveyor")
+        lines.append("   located beneath the CBS loop. This conveyor transports the bags out of shipment sorter to")
+        lines.append("   Outbound sorter located beneath base mezzanine in the approx. centre of the loop CBS.")
     
     lines.append("=" * 70)
     
@@ -1323,6 +1679,13 @@ def call_groq_for_process_flow(client_name: str, project_name: str, dxf_json: di
         # ===================================================================
         
         final_flow = best_flow.strip()
+        
+        # Fix empty Output Chutes section if needed
+        final_flow = agentY_fix_empty_output_chutes(final_flow, safe_dxf_json, client_name)
+        
+        # Apply text normalizations: Cross Belt Sorter capitalization and client name consistency
+        final_flow = normalize_proposal_text(final_flow, client_name)
+        
         logger.info(f"Final result: Best score {best_score:.2f} achieved in iteration {best_iteration}")
         logger.info(f"Total iterations: {len(iteration_details)}")
         
@@ -1338,9 +1701,10 @@ def call_groq_for_process_flow(client_name: str, project_name: str, dxf_json: di
 # ==================== MERMAID FLOWCHART GENERATION ====================
 
 def sanitize_mermaid_for_render(code: str) -> str:
-    """Minimal sanitization for Mermaid code."""
+    """Sanitize Mermaid code for reliable rendering."""
     if not code: return code
     code = code.strip()
+    # Remove markdown fences
     if code.startswith("```"):
         lines = code.split("\n")
         if lines[0].strip().startswith("```"): lines = lines[1:]
@@ -1348,7 +1712,15 @@ def sanitize_mermaid_for_render(code: str) -> str:
         code = "\n".join(lines).strip()
     if code.lower().startswith("mermaid"): code = code[7:].strip()
     if not code.lower().startswith("flowchart"): return code
-    return code.replace("\r\n", "\n").replace("\r", "\n")
+    
+    # Normalize line endings
+    code = code.replace("\r\n", "\n").replace("\r", "\n")
+    
+    # Fix edge labels with parentheses - they cause rendering issues
+    # Pattern: -->|(text with parens)| becomes -->|text without parens|
+    code = re.sub(r'\|([^|]*)\(([^)]*)\)([^|]*)\|', r'|\1\2\3|', code)
+    
+    return code
 
 def generate_mermaid_png(mermaid_code: str) -> tuple:
     """Render Mermaid diagram to PNG."""
@@ -1380,42 +1752,319 @@ def generate_mermaid_png(mermaid_code: str) -> tuple:
     
     raise RuntimeError(f"Failed to render Mermaid:\n" + "\n".join(logs))
 
-def call_groq_for_mermaid(process_flow_text: str):
-    """Generate Mermaid flowchart code from process flow."""
-    system_prompt = """You are a diagram expert for Mermaid v11 flowcharts.
-RULES:
-- Start with: flowchart TD (top-down)
-- Simple IDs: A, B, C, D (no special chars)
-- Square brackets for labels: A[Start]
-- Short labels (2-5 words)
-- Use --> for arrows
-- Apply colors using classDef and :::className
-- Green (#90EE90) for input, Blue (#87CEEB) for process, Yellow (#FFE97F) for sorting, 
-  Orange (#FFB366) for collection, Red (#FFB3B3) for rejection
-- Output ONLY mermaid code, no backticks
-**MUST FOLLOW - ONLY RAW output DO NOT ADD ```mermaid``` or ``` or any extra text in response***"""
 
-    user_prompt = f"""Convert to vertical Mermaid flowchart with colors:
+def call_groq_for_mermaid(process_flow_text: str) -> str:
+    """
+    Generate an accurate Mermaid v11 flowchart (flowchart TD) from CBS process-flow text.
+
+    Key upgrade vs. your current version:
+    - Groq returns STRICT GRAPH JSON (nodes + edges) only
+    - Python renders Mermaid deterministically (prevents structural drift: merges/branches/loops)
+    """
+
+    # -----------------------------
+    # 1) Helpers (local)
+    # -----------------------------
+    def _clean_text(t: str) -> str:
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        # remove repeated blank lines
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
+    def _extract_skeleton(t: str) -> Dict[str, Any]:
+        """
+        Best-effort structure extraction to help the LLM:
+        - Sections like "Infeed System:" / "Auto Induct Line:" (with or without numbering)
+        - Subpoints like "a. Sliding Chutes - ..." under an output section
+        """
+        text = _clean_text(t)
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+        # Skip a standalone "Process Flow" header if present
+        if lines and lines[0].lower() in ("process flow", "processflow"):
+            lines = lines[1:]
+
+        section_header_re = re.compile(
+            r"""^(?:\d+\.\s*)?        # optional leading numbering
+                ([A-Za-z][A-Za-z0-9 /,&()\-]+?)  # title
+                \s*:\s*-?\s*          # : or :- separator
+                (.*)$                 # rest of line
+            """,
+            re.VERBOSE,
+        )
+
+        subpoint_re = re.compile(
+            r"""^([a-eA-E])\.\s+(.+?)\s*(?:-|\:)\s*(.*)$""", re.VERBOSE
+        )
+
+        sections: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+
+        def push_current():
+            nonlocal current
+            if current:
+                # normalize spacing
+                current["title"] = re.sub(r"\s+", " ", current["title"]).strip()
+                current["desc"] = re.sub(r"\s+", " ", current["desc"]).strip()
+                sections.append(current)
+            current = None
+
+        for ln in lines:
+            m = section_header_re.match(ln)
+            if m:
+                push_current()
+                title = m.group(1).strip()
+                rest = m.group(2).strip()
+                current = {"title": title, "desc": rest, "subpoints": []}
+                continue
+
+            sm = subpoint_re.match(ln)
+            if sm and current is not None:
+                sp_title = sm.group(2).strip()
+                sp_desc = sm.group(3).strip()
+                current["subpoints"].append(
+                    {
+                        "key": sm.group(1).lower(),
+                        "title": re.sub(r"\s+", " ", sp_title),
+                        "desc": re.sub(r"\s+", " ", sp_desc),
+                    }
+                )
+                continue
+
+            # Continuation line
+            if current is None:
+                # If text starts without a clean header, create a generic section
+                current = {"title": "Step", "desc": ln, "subpoints": []}
+            else:
+                current["desc"] += " " + ln
+
+        push_current()
+
+        # Lightweight loop hints
+        loop_hints = []
+        joined = " ".join(lines).lower()
+        if any(k in joined for k in ["refeed", "re-feed", "again fed", "recirculation", "recirculate"]):
+            loop_hints.append("has_refeed_or_recirculation")
+        if "optional" in joined:
+            loop_hints.append("has_optional_branch")
+        if any(k in joined for k in ["manual induct", "manual infeed"]) and any(
+            k in joined for k in ["auto induct", "autoinduct", "auto induction"]
+        ):
+            loop_hints.append("has_parallel_manual_and_auto")
+
+        return {"sections": sections, "hints": loop_hints}
+
+    def _extract_json_object(s: str) -> str:
+        """
+        Pull the first {...} JSON object from a messy model output.
+        """
+        s = s.strip()
+        # strip code fences if model disobeys
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+        # find first JSON object
+        start = s.find("{")
+        end = s.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("No JSON object found in model output")
+        return s[start : end + 1]
+
+    def _num_to_id(n: int) -> str:
+        """
+        0->A, 1->B ... 25->Z, 26->AA ...
+        """
+        letters = string.ascii_uppercase
+        out = ""
+        n_local = n
+        while True:
+            out = letters[n_local % 26] + out
+            n_local = (n_local // 26) - 1
+            if n_local < 0:
+                break
+        return out
+
+    def _render_mermaid(graph: Dict[str, Any]) -> str:
+        """
+        Deterministic Mermaid rendering with classDefs + :::className.
+        """
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+
+        # Validate minimal schema
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            raise ValueError("Graph JSON must have 'nodes' and 'edges' as lists")
+
+        # Map model keys -> Mermaid IDs (A, B, C...)
+        key_to_mid: Dict[str, str] = {}
+        mermaid_nodes: List[str] = []
+
+        for i, nd in enumerate(nodes):
+            k = str(nd.get("key", "")).strip()
+            label = str(nd.get("label", "")).strip()
+            cls = str(nd.get("class", "")).strip()
+
+            if not k or not label:
+                continue
+
+            mid = _num_to_id(len(key_to_mid))
+            key_to_mid[k] = mid
+
+            # keep labels short-ish (model should already do it)
+            label = re.sub(r"\s+", " ", label)
+            mermaid_nodes.append(f'{mid}[{label}]:::{cls}')
+
+        # Edge lines
+        mermaid_edges: List[str] = []
+        for ed in edges:
+            f = str(ed.get("from", "")).strip()
+            t = str(ed.get("to", "")).strip()
+            lbl = str(ed.get("label", "")).strip()
+
+            if f not in key_to_mid or t not in key_to_mid:
+                continue
+
+            fm = key_to_mid[f]
+            tm = key_to_mid[t]
+
+            if lbl:
+                lbl = re.sub(r"\s+", " ", lbl)
+                # Sanitize edge labels: remove parentheses and special chars that break Mermaid
+                lbl = lbl.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+                lbl = lbl.replace('"', "'").replace("|", "-").replace("#", "")
+                lbl = lbl.strip()
+                if lbl:
+                    mermaid_edges.append(f"{fm} -->|{lbl}| {tm}")
+                else:
+                    mermaid_edges.append(f"{fm} --> {tm}")
+            else:
+                mermaid_edges.append(f"{fm} --> {tm}")
+
+        # Class definitions (as per your palette)
+        class_defs = [
+            "classDef input fill:#90EE90,stroke:#333,color:#000;",
+            "classDef process fill:#87CEEB,stroke:#333,color:#000;",
+            "classDef sorting fill:#FFE97F,stroke:#333,color:#000;",
+            "classDef collection fill:#FFB366,stroke:#333,color:#000;",
+            "classDef rejection fill:#FFB3B3,stroke:#333,color:#000;",
+        ]
+
+        out = []
+        out.append("flowchart TD")
+        out.extend(mermaid_nodes)
+        out.extend(mermaid_edges)
+        out.extend(class_defs)
+        return "\n".join(out).strip()
+
+    # -----------------------------
+    # 2) Build prompt (graph-first)
+    # -----------------------------
+    process_flow_text = _clean_text(process_flow_text)
+    skeleton = _extract_skeleton(process_flow_text)
+
+    system_prompt = """
+You are a warehouse automation diagram expert.
+
+TASK:
+Convert the given CBS process-flow text into a STRICT directed graph (JSON) that matches real material-flow logic.
+
+OUTPUT RULES (NON-NEGOTIABLE):
+- Output ONLY one valid JSON object. No markdown. No commentary. No mermaid.
+- JSON schema must be EXACTLY:
+{
+  "nodes": [
+    {"key":"n1","label":"2-5 word label","class":"input|process|sorting|collection|rejection"}
+  ],
+  "edges": [
+    {"from":"n1","to":"n2","label":""}
+  ]
+}
+
+ACCURACY RULES:
+1) Preserve terminology from the text (e.g., "Infeed", "Induct", "Loop CBS", "Rejection Chutes").
+2) Build the main spine in the correct order (typical: Sources -> Infeed -> Induct -> CBS -> Outputs).
+3) If multiple sources exist (e.g., Marketplace + FC), they MUST MERGE into the Infeed node.
+4) If both Auto + Manual induct/infeed exist, they MUST be PARALLEL BRANCHES that MERGE into the CBS node.
+5) Output section with subpoints (a/b/c/...) MUST become PARALLEL BRANCHES from the CBS node (or from "Output Chutes"/"Sorting Output" if present).
+6) Optional items MUST be shown as a branch edge label "(Optional)".
+7) Exception refeeding / recirculation MUST be shown as a LOOP-BACK edge to the correct upstream point (usually Infeed or Induct).
+8) Do NOT invent new equipment. If not mentioned, don’t add it.
+
+CLASS RULES (use exactly these class names):
+- input: sources / entry points (e.g., Fulfilment Centre, Marketplace, Telescopic Conveyor)
+- process: conveyors, infeed lines, VDS loop, induct lines/stations, takeaway conveyors
+- sorting: CBS / Loop / main sorter / scanning in sorter
+- collection: chutes, PTL sorting, pallets, bags, outbound collection points
+- rejection: rejection chutes, manual exception handling, exception refeeding zone
+
+LABEL RULES:
+- Keep labels 2–5 words.
+- Use Title Case.
+- Avoid long sentences.
+""".strip()
+
+    user_prompt = f"""
+RAW PROCESS FLOW:
 {process_flow_text}
 
-Use flowchart TD, simple node IDs (A,B,C), short labels, apply color coding with classDef."""
+EXTRACTED STRUCTURE (HINTS, MUST NOT OVERRIDE RAW TEXT):
+{skeleton}
 
-    def api_call():
+Now output the graph JSON only (nodes + edges) following the rules.
+""".strip()
+
+    def api_call_graph():
         return groq_client.chat.completions.create(
             model="groq/compound",
             messages=[
-                {"role": "system", "content": system_prompt.strip()},
-                {"role": "user", "content": user_prompt.strip()},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.0,
             max_tokens=2000,
         )
-    
-    resp = call_groq_with_retry(api_call)
-    mermaid_code = resp.choices[0].message.content.strip()
-    mermaid_code = re.sub(r"^```(?:mermaid)?\s*", "", mermaid_code, flags=re.MULTILINE)
-    mermaid_code = re.sub(r"\s*```$", "", mermaid_code, flags=re.MULTILINE)
-    return mermaid_code.strip()
+
+    # -----------------------------
+    # 3) Call Groq + parse JSON (with a strict retry)
+    # -----------------------------
+    resp = call_groq_with_retry(api_call_graph)
+    raw = resp.choices[0].message.content.strip()
+
+    try:
+        graph_json_str = _extract_json_object(raw)
+        graph = json.loads(graph_json_str)
+    except Exception:
+        # Hard retry with an even stricter "repair" instruction
+        repair_system = "You MUST output ONLY valid JSON for the specified schema. No other text."
+        repair_user = f"""
+Fix the following into ONE valid JSON object that matches the required schema exactly.
+Do not add commentary.
+
+BAD_OUTPUT:
+{raw}
+""".strip()
+
+        def api_call_repair():
+            return groq_client.chat.completions.create(
+                model="groq/compound",
+                messages=[
+                    {"role": "system", "content": repair_system},
+                    {"role": "user", "content": repair_user},
+                ],
+                temperature=0.0,
+                max_tokens=2000,
+            )
+
+        resp2 = call_groq_with_retry(api_call_repair)
+        raw2 = resp2.choices[0].message.content.strip()
+        graph_json_str = _extract_json_object(raw2)
+        graph = json.loads(graph_json_str)
+
+    # -----------------------------
+    # 4) Render Mermaid deterministically
+    # -----------------------------
+    mermaid_code = _render_mermaid(graph)
+    return mermaid_code
+
 
 def extract_full_text_from_docx(doc: Document) -> str:
     """Concatenate all paragraph and table text from the DOCX."""
@@ -1727,6 +2376,381 @@ def call_groq_for_bom(sheet_text: str) -> dict:
         st.error(f"Failed to generate Proposed System Technical Details: {e}")
         return None
 
+
+def generate_mechanical_bom_from_costing(costing_file) -> list:
+    """
+    Generate Mechanical equipment BOM using Groq API for clean table formatting.
+    Extracts data from all relevant sheets and uses LLM to aggregate into proper format.
+    
+    Args:
+        costing_file: Streamlit UploadedFile object containing the costing Excel workbook
+        
+    Returns:
+        List of dict items with keys: pos, qty, description, value
+        Each item represents ONE row in the final table with multi-line description/value
+    """
+    
+    def clean_float(val, suffix=""):
+        """Format float values cleanly with rounding."""
+        try:
+            if val is None:
+                return ""
+            if isinstance(val, str):
+                val = float(val.replace(",", ""))
+            # Round to avoid floating point precision issues
+            if val == int(val):
+                return f"~{int(val)}{suffix}"
+            else:
+                return f"~{round(val, 1)}{suffix}"
+        except:
+            return str(val)
+    
+    try:
+        xlsx_bytes = costing_file.getvalue()
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        
+        # Extract data from all relevant sheets for comprehensive BOM generation
+        extracted_data = []
+        
+        # Detect sheet roles
+        roles = bom_module.detect_sheets_by_role(wb)
+        
+        # 1. Extract Conveyors data
+        conv_sheet = roles.get("conveyors")
+        if conv_sheet:
+            ws = wb[conv_sheet]
+            df = bom_module.extract_table(ws, ["name", "conveyor length", "set"])
+            if not df.empty:
+                df = bom_module.normalize_conveyor_columns(df)
+                conv_sum = bom_module.summarize_conveyors(df)
+                for _, row in conv_sum.iterrows():
+                    name = row.get('name', '')
+                    total_m = round(float(row.get('total_m', 0)), 1)
+                    units = int(row.get('units', 0))
+                    extracted_data.append(f"CONVEYOR: {name} | Length: ~{total_m} m | Units: {units}")
+        
+        # 2. Extract Loop CBS / Sorter data
+        loop_sheets = roles.get("loop_cbs_multi", [])
+        for loop_sheet in loop_sheets:
+            ws = wb[loop_sheet]
+            extracted_data.append(f"\nSORTER_SHEET: {loop_sheet}")
+            # Extract key sorter parameters with clean formatting
+            for label, patterns, suffix in [
+                ("Sorter Height", [r"sorter\s*height", r"height"], "mm"),
+                ("Loop Length", [r"loop\s*length", r"sorter\s*length"], " m"),
+                ("Carrier Pitch", [r"carrier\s*pitch", r"pitch"], " mm"),
+                ("Sorter Speed", [r"speed", r"sorter\s*speed"], " m/s"),
+                ("Drive Type", [r"drive", r"sorter\s*drive"], ""),
+            ]:
+                val = bom_module.find_value_near_label(ws, patterns)
+                if val and val.value:
+                    raw_val = val.value
+                    # Clean the value
+                    if bom_module.is_num(raw_val):
+                        clean_val = clean_float(raw_val, suffix)
+                    else:
+                        clean_val = str(raw_val).strip()
+                    extracted_data.append(f"SORTER_PARAM: {label} = {clean_val}")
+        
+        # 3. Extract Destinations / Chutes data
+        dest_sheet = roles.get("destinations")
+        if dest_sheet:
+            ws = wb[dest_sheet]
+            df = bom_module.extract_table(ws, ["description", "qty"])
+            if not df.empty:
+                df.columns = [bom_module.norm(c) for c in df.columns]
+                desc_col = next((c for c in df.columns if "description" in c), None)
+                qty_col = next((c for c in df.columns if "qty" in c), None)
+                if desc_col and qty_col:
+                    for _, row in df.iterrows():
+                        d = str(row.get(desc_col, "")).strip()
+                        q = row.get(qty_col, "")
+                        if d and d.lower() not in ['nan', 'none', '']:
+                            qty_val = bom_module.safe_int(q, 0) if bom_module.is_num(q) else str(q)
+                            extracted_data.append(f"CHUTE: {d} | Qty: {qty_val} Nos")
+        
+        # 4. Extract PTL data
+        ptl_sheet = roles.get("ptl")
+        if ptl_sheet:
+            ws = wb[ptl_sheet]
+            df = bom_module.extract_table(ws, ["description", "qty"])
+            if not df.empty:
+                df.columns = [bom_module.norm(c) for c in df.columns]
+                desc_col = next((c for c in df.columns if "description" in c), None)
+                qty_col = next((c for c in df.columns if "qty" in c or "modules" in c), None)
+                if desc_col:
+                    for _, row in df.iterrows():
+                        d = str(row.get(desc_col, "")).strip()
+                        q = row.get(qty_col, "") if qty_col else ""
+                        if d and d.lower() not in ['nan', 'none', '']:
+                            qty_val = bom_module.safe_int(q, 0) if bom_module.is_num(q) else str(q)
+                            extracted_data.append(f"PTL: {d} | Qty: {qty_val} Nos")
+        
+        # 5. Extract Steel Works data
+        steel_sheet = roles.get("steelworks")
+        if steel_sheet:
+            ws = wb[steel_sheet]
+            df = bom_module.extract_table(ws, ["description", "qty"])
+            if not df.empty:
+                df.columns = [bom_module.norm(c) for c in df.columns]
+                desc_col = next((c for c in df.columns if "description" in c), None)
+                qty_col = next((c for c in df.columns if "qty" in c), None)
+                area_col = next((c for c in df.columns if "area" in c), None)
+                if desc_col:
+                    for _, row in df.iterrows():
+                        d = str(row.get(desc_col, "")).strip()
+                        if d and d.lower() not in ['nan', 'none', '']:
+                            val = "Included"
+                            if area_col and bom_module.is_num(row.get(area_col)):
+                                val = f"~{round(bom_module.to_float(row.get(area_col), 0), 2)} SQM"
+                            elif qty_col and bom_module.is_num(row.get(qty_col)):
+                                val = f"{bom_module.safe_int(row.get(qty_col), 0)} Nos"
+                            extracted_data.append(f"STEELWORK: {d} | Value: {val}")
+        
+        # 6. Extract Technical Specifications
+        tech_sheet = roles.get("tech_specs")
+        if tech_sheet:
+            ws = wb[tech_sheet]
+            for label, patterns in [
+                ("Number of Feedlines", [r"feedline", r"feed\s*line", r"no.*of.*feedlines"]),
+                ("Throughput", [r"throughput", r"pph", r"parcels.*per.*hour"]),
+                ("Number of Zones", [r"zone", r"no.*of.*zones"]),
+            ]:
+                val = bom_module.find_value_near_label(ws, patterns)
+                if val and val.value:
+                    clean_val = bom_module.safe_int(val.value, 0) if bom_module.is_num(val.value) else str(val.value)
+                    extracted_data.append(f"TECH_SPEC: {label} = {clean_val}")
+        
+        if not extracted_data:
+            st.warning("No relevant data found in costing sheets for mechanical BOM")
+            return []
+        
+        # Call Groq API to generate clean BOM table
+        raw_items = call_groq_for_mechanical_bom("\n".join(extracted_data))
+        
+        # Post-process to clean up values and ensure proper formatting
+        return post_process_mechanical_bom(raw_items)
+        
+    except Exception as e:
+        st.warning(f"Could not generate mechanical BOM from costing file: {e}")
+        return []
+
+
+def format_number_cleanly(val: str) -> str:
+    """Format numbers cleanly - round floats, add ~ prefix for approximations."""
+    import re
+    # Handle floating point precision issues like 149.99999999999997
+    pattern = r'(\d+)\.(\d{10,})'
+    
+    def round_match(m):
+        whole = int(m.group(1))
+        decimal = m.group(2)
+        # Round to nearest integer if very close
+        if decimal.startswith('9999') or decimal.startswith('0000'):
+            return f"~{round(float(m.group(0)))}"
+        else:
+            return f"~{round(float(m.group(0)), 1)}"
+    
+    return re.sub(pattern, round_match, val)
+
+
+def post_process_mechanical_bom(items: list) -> list:
+    """Clean up and format mechanical BOM items for professional output."""
+    if not items:
+        return []
+    
+    cleaned_items = []
+    for item in items:
+        # Clean description - remove placeholder text
+        desc = str(item.get("description", ""))
+        desc = desc.replace("\\n", "\n")
+        
+        # Remove placeholder/not found text
+        lines_to_remove = [
+            "no specific", "not found", "not specified", "no data",
+            "no equipment found", "no conveyors found", "no feedline"
+        ]
+        desc_lines = desc.split("\n")
+        clean_desc_lines = []
+        for line in desc_lines:
+            line_lower = line.lower().strip()
+            if not any(phrase in line_lower for phrase in lines_to_remove):
+                clean_desc_lines.append(line)
+        desc = "\n".join(clean_desc_lines)
+        
+        # Clean value - format numbers, remove bad values
+        val = str(item.get("value", ""))
+        val = val.replace("\\n", "\n")
+        
+        # Format floating point numbers cleanly
+        val = format_number_cleanly(val)
+        
+        # Remove lines with garbage values
+        val_lines = val.split("\n")
+        clean_val_lines = []
+        for line in val_lines:
+            line_stripped = line.strip()
+            # Skip empty lines, "not specified", garbage numbers
+            if not line_stripped:
+                continue
+            if "not specified" in line_stripped.lower():
+                clean_val_lines.append("Included")
+                continue
+            if "carrier type" in line_stripped.lower():
+                continue
+            # Check for garbage large numbers (likely cell references or errors)
+            try:
+                num = float(line_stripped.replace("~", "").replace("m", "").replace("mm", "").strip())
+                if num > 100000:  # Likely garbage
+                    continue
+            except:
+                pass
+            clean_val_lines.append(line_stripped)
+        
+        # If no valid values, use "Included"
+        if not clean_val_lines:
+            clean_val_lines = ["Included"]
+        
+        val = "\n".join(clean_val_lines)
+        
+        # Skip items with empty descriptions after cleaning
+        if not desc.strip() or desc.strip().lower() in ["", "none", "n/a"]:
+            continue
+        
+        cleaned_items.append({
+            "pos": item.get("pos", ""),
+            "qty": str(item.get("qty", "1")),
+            "description": desc,
+            "value": val
+        })
+    
+    return cleaned_items
+
+
+# Prompt for Mechanical BOM generation using Groq
+MECHANICAL_BOM_PROMPT = """
+You are a proposal BOM table generator for Cross Belt Sorter (CBS) projects at Falcon Autotech.
+
+TASK: Generate a clean "Mechanical equipment" table from the extracted Excel data.
+
+OUTPUT FORMAT - Each item MUST have exactly these 4 fields:
+- pos: Position number (integer: 1, 2, 3, etc.)
+- qty: Quantity as string (e.g., "1", "3", "12")
+- description: Multi-line text with title + bullet points
+- value: Corresponding values for each bullet point OR "Included"
+
+CRITICAL FORMATTING RULES:
+
+1. DESCRIPTION COLUMN FORMAT:
+   - First line: Main system title (bold heading)
+   - Second line (optional): Sub-title like "Consists of" or "1 Loop Cross Belt Sorter"
+   - Bullet points: Start with "• " (bullet + space)
+   - For conveyors with measurements: "• PVC belt Conveyor- 394.8 m; 39 Modules"
+   - For general items: "• Buffer Conveyor" or "• Standard Sorter Supports"
+
+2. VALUE COLUMN FORMAT:
+   - Each value corresponds to a description line
+   - Use actual measurements when available (e.g., "~38 metres (9 Modules)", "2900mm", "~150m")
+   - Use "X Set" or "X No" for quantities (e.g., "4 Set", "1 No", "50 Nos")
+   - Use "Included" when no specific value is available
+   - Round all numbers: No decimals beyond 1 place, use ~ for approximations
+   - NEVER use placeholder text like "Not specified" or "No data found"
+
+3. STANDARD POSITIONS:
+   Pos 1: Auto Infeed System - PVC conveyors, curve conveyors, modular conveyors
+   Pos 2: Auto Induct Feedlines - Buffer, angle merge, spacing conveyors
+   Pos 3: Sorter - Loop Cross Belt Sorter with all parameters and inclusions
+   Pos 4: Sorter Outputs - Chutes (sliding, rejection, double deck)
+   Pos 5: PTL - Pick to Light systems (if present)
+   Pos 6: Steel Works - Operator platforms, structures (if present)
+
+4. VALUE ALIGNMENT EXAMPLES:
+   Description: "• Sorter Height"     → Value: "2900mm"
+   Description: "• Sorter Length"     → Value: "~150m"
+   Description: "• Buffer Conveyor"   → Value: "4 Set"
+   Description: "• Angle merge"       → Value: "1 Set"
+   Description: "• Standard Sorter Supports" → Value: "Included"
+
+EXAMPLE OUTPUT:
+{
+  "items": [
+    {
+      "pos": 1,
+      "qty": "1",
+      "description": "Auto Infeed System\\n• Powered Belt Conveyors\\n• Curve Conveyor",
+      "value": "~38 metres (9 Modules)\\n1 No"
+    },
+    {
+      "pos": 2,
+      "qty": "3",
+      "description": "Auto Induct Feedlines\\nConsists of\\n• Buffer Conveyor\\n• Angle merge\\n• Spacing Conveyor",
+      "value": "4 Set\\n1 Set\\n2 Set"
+    },
+    {
+      "pos": 3,
+      "qty": "1",
+      "description": "Sorter\\n1 Loop Cross Belt Sorter\\n• Sorter Height\\n• Sorter Length\\nIncluding:\\n• Standard Sorter Supports\\n• Product Centring System\\n• 5 Side Scanning System\\n• Hooter\\n• Emergency Stop Buttons",
+      "value": "2900mm\\n~150m"
+    }
+  ]
+}
+
+IMPORTANT:
+- Use \\n for newlines in JSON strings
+- Round all decimal numbers (149.99999 → ~150)
+- NEVER include "No data found", "Not specified", or similar placeholder text
+- If data is missing for an item, either skip it OR use "Included" as value
+- Match the number of value lines to the number of measurable description lines
+"""
+
+
+def call_groq_for_mechanical_bom(extracted_data: str) -> list:
+    """Call Groq API to generate clean Mechanical BOM from extracted sheet data."""
+    user_prompt = f"""
+Generate a Mechanical equipment BOM table from the following extracted costing data.
+
+EXTRACTED DATA:
+{extracted_data}
+
+INSTRUCTIONS:
+1. Create 4-7 position rows (Infeed, Feedlines, Sorter, Outputs, PTL, Steel Works)
+2. Use actual values from data - round numbers properly (e.g., 149.99 → ~150)
+3. Use "Included" for items without specific measurements
+4. Format as JSON with "items" array
+
+Return ONLY valid JSON. No explanation text.
+"""
+
+    def api_call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": MECHANICAL_BOM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+    try:
+        resp = call_groq_with_retry(api_call)
+        result = json.loads(resp.choices[0].message.content)
+        # Handle both {"items": [...]} and direct array formats
+        if isinstance(result, list):
+            return result
+        elif isinstance(result, dict) and "items" in result:
+            return result["items"]
+        elif isinstance(result, dict):
+            # Try to find any array in the result
+            for key, val in result.items():
+                if isinstance(val, list):
+                    return val
+        return []
+    except Exception as e:
+        st.warning(f"Failed to generate Mechanical BOM via Groq: {e}")
+        return []
+
+
 # ==================== GROQ PROMPTS & CONSTANTS ====================
 
 # Cover Letter System Prompt
@@ -1760,7 +2784,8 @@ STRICT LENGTH LIMIT: Maximum 300 words to ensure single-page fit. Be concise and
 
 4. Middle paragraph - System Overview & Analysis (CRITICAL):
    - State that Falcon has done an in-depth data analysis and evaluated various solution options.
-   - **MANDATORY: Include the high-level process flow summary if provided**. Mention key system components naturally in a single sentence (e.g., "The proposed solution includes automatic induct conveyors, cross-belt sorter with scanner systems, and output chutes for efficient sortation").
+   - **MANDATORY: Include the high-level process flow summary if provided**. Mention key system components naturally in a single sentence (e.g., "The proposed solution includes automatic induct conveyors, {cbs_type} for efficient sortation, and output chutes for sorted parcel handling").
+   - **CRITICAL: Use the EXACT CBS TYPE** from the context (either "Linear CBS" or "Loop CBS") - do NOT use generic "cross-belt sorter"
    - Highlight any specific technical values, quantities, or capacities if mentioned (e.g., "200 destinations", "5 camera scanner systems", "2 speed settings").
    - Keep this brief but informative - demonstrate technical understanding without overwhelming detail.
    - Mention that the detailed technical proposal is laid out in various sections to provide full insight into the proposed solution.
@@ -1816,273 +2841,97 @@ Return ONLY the cover letter text, without markdown code fences or extra comment
 # Executive Summary System Prompt
 EXEC_SUMMARY_SYSTEM_PROMPT = """
 You are a Proposal Writing Assistant specialized in Falcon Autotech automation projects.  
-Falcon Autotech designs, manufactures, supplies, implements, and maintains warehouse automation solutions—such as sortation systems, conveyor automation, pick/put-to-light, ASRS robotics, and dimension & weight scanning—for industries including e-commerce, fashion, FMCG, pharma, groceries, and CE-P.  
-The writing style must be indistinguishable from natural human writing. The text should read as if drafted by an experienced professional, not an AI system. Use clear, simple, and natural language with varied sentence lengths and structures. Avoid generic phrases, repetitive patterns, or mechanical tone. Ensure that the output flows smoothly, conveys intent naturally, and would not be detected as machine-generated. The content should feel thoughtful, context-aware, and aligned with how a human proposal writer or business professional would communicate.
+Falcon Autotech designs, manufactures, supplies, implements, and maintains warehouse automation solutions—such as sortation systems, conveyor automation, pick/put-to-light, ASRS robotics, and dimension & weight scanning—for industries including e-commerce, fashion, FMCG, pharma, groceries, and CE-P.
 
-Your task is to generate **unique, client-tailored Executive Summaries** based on the "Proposed System Description" section of Falcon proposals.  
-The summary must always reflect Falcon's style but **no two summaries should ever be identical**. Introduce subtle variations in wording, phrasing, and sentence structure while keeping the same professional tone.  
+The writing style must be indistinguishable from natural human writing. The text should read as if drafted by an experienced proposal engineer, not an AI system. Use clear, professional language with varied sentence structures.
 
-### Writing Rules
+Your task is to generate **unique, client-tailored Executive Summaries** based on the "Proposed System Description" section of Falcon proposals.
 
-**Opening Section**
-- Begin with Falcon Autotech's commitment and strong interest in responding to the client's requirement.  
-- Mention Falcon's partnership approach, customization, and proven track record.  
-- Use varied sentence structures and synonyms so every generation feels different.  
+### EXACT STRUCTURE TO FOLLOW
 
-**Bullet Points**
-- Provide exactly **4–5 high-level system features or modules**.  
-- Each bullet MUST be short, clear, and client-friendly (e.g., "Spiral Conveyors for smooth material flow").  
-- Avoid technical specifications, sub-bullets, or repeating the same idea in different words.  
-- The order of bullets should vary slightly between generations.  
-- Add numeric along with the components ONLY IF extensively mentioned in Proposed System Description
-- Bold the main components of the system. There can be max 2-3 bold words.
-- **CRITICAL: Always use numeric format for quantities (e.g., 3, 9, 24, 202) instead of words (e.g., three, nine, twenty-four).**
+**OPENING PARAGRAPH** (combine into ONE flowing paragraph)
+Write as a single connected paragraph containing:
+- "Falcon is pleased to confirm its great interest in responding to this RFQ."
+- "Our team has been working closely with the relevant stakeholders, with a clear commitment to listening and understanding your needs and ensuring this project's success."
+- "As prime contractor, Falcon ensures its full commitment to successfully completing this project."
+- "Following the same objective for the system, we are happy to offer a compliant solution meeting all technical and operational requirements, high-performance, optimized, tailor-made, fast and secure planning, and a competitive price."
 
-**Closing Section**
-- End with a **personalized closing statement**.  
-- Reaffirm that the solution is tailored to meet the client's technical and operational requirements.  
-- Mention the RFP/customization and highlight benefits like efficiency, smooth material flow, and faster TAT.  
-- Closing phrasing should change between runs (use variations in tone, sentence structure, and emphasis).  
+**KEY CHARACTERISTICS SECTION**
+- Start with EXACTLY ONE LINE: "Our solution is based on the following key characteristics:"
+- DO NOT REPEAT THIS LINE
+- Then provide 4-6 bullet points as FULL DESCRIPTIVE SENTENCES
 
-### Important Constraints
-- Keep the tone formal, professional, and benefit-driven.  
-- Do **not** reuse exact sentences from earlier examples.  
-- Ensure variability: two runs for the same input must never produce identical text.  
-- Do **not** add any extra sections outside the defined structure.  
+**BULLET POINT RULES - CRITICAL:**
+Each bullet must be a COMPLETE SENTENCE with context (not just item names). Use these patterns:
 
-### Output Format
-1. Opening paragraph (commitment + partnership).  
-2. 4–6 bullet points (system modules).  
-3. Closing personalized statement.  
+BULLET 1 - CBS/Sorter (ALWAYS FIRST):
+- Use EXACT CBS TYPE from metadata: "Linear CBS for parcel sorting..." or "Loop CBS for parcel sorting..."
+- Full format: "[Linear CBS/Loop CBS] for parcel sorting, employing cross-belt technology, has been designed to handle a throughput of [PPH] packages per hour."
+- CRITICAL: Do NOT use generic "[Loop CBS / Linear CBS]" - use the SPECIFIC type from the project
+
+BULLET 2 - Induct System (combine feedlines + manual in ONE bullet):
+- Use EXACT CBS TYPE: "This Linear CBS is equipped with..." or "This Loop CBS is equipped with..."
+- Full format: "This [Linear CBS/Loop CBS] is equipped with [COUNT] Nos fully automatic induct lines, along with manual loading point."
+- OR "The system features [COUNT] induct lines for automated parcel induction, with provision for manual loading."
+- NOTE: Do NOT count manual stations separately. Just mention "manual loading point" as part of induct bullet.
+- CRITICAL: Use the SPECIFIC CBS type from the project, not generic "[Loop/Linear]"
+
+BULLET 3 - Conveyor/Transport System:
+- "The system is having its own conveyor connection to transport the volume from primary loading points to the induction zone."
+- OR "Infeed conveyor system including [COUNT] telescopic conveyors for efficient parcel receiving."
+
+BULLET 4 - Chutes (combine all chute types in ONE bullet):
+- "In the system, there are [X] gravity chutes, [Y] mini-gravity chutes, [Z] rejection chutes, and [W] bulk chute for efficient parcel distribution."
+- OR "The system includes [TOTAL] chutes comprising gravity, collection, and rejection chutes for sorted parcel handling."
+
+BULLET 5 - Layout/Operations (if needed):
+- "The system layout has been meticulously planned to facilitate smooth operational flow, ensuring efficient movement of personnel."
+
+**CLOSING SECTION** (separate paragraph after bullets)
+"A tailor-made and simple layout, specifically designed to [CLIENT NAME]. The proposed layout is the result of the technical requirements in the RFP document and our discussions with the relevant stakeholders during our site visit and Teams workshop meeting."
+Then add as dash points:
+- Simple operational conditions due to one single [loop/linear] cross belt sorter.
+- Easy maintenance: optimized number of conveyors and concentrated inducts area.
+
+**FIXED SECTION** (MUST PASTE EXACTLY AS BELOW AFTER CLOSING)
+**1. Falcon's reliable Shipment sortation systems** 
+These systems are globally being used by most innovative brands such as Amazon, Flipkart, Delhivery, Asendia, Fastway and many more. The main and critical components of the FALCON Autotech sorter building blocks, like wheels, motors, belts, bearings, Bus Bars, Communication platforms, PLCs etc., are sourced from some of the best suppliers in the world, such as SEW, Siemens, SICK, Faigle, Vahle and Forbo. This strategic baseline of sourcing policy allows Falcon's customers to be fully confident in the systems' robustness and reliability.
+
+**2. Commitment to quality systems** 
+Demonstrating Falcon's clear commitment to the {client_name}'s satisfaction, the shipment sortation system, parts and services will be under warranty for 12 months from installation go-live. 
+
+
+### CRITICAL RULES
+1. DO NOT repeat "Our solution is based on the following key characteristics:" - write it only ONCE
+2. Each bullet must be a FULL SENTENCE with explanation, not just item names
+3. DO NOT count manual induct stations - just mention "manual loading point" as part of another bullet
+4. Combine related items: feedlines + manual in one bullet, all chutes in one bullet
+5. Use "Induct Lines" not "Feedlines" in the output
+6. Throughput format: "[NUMBER] packages per hour" or "[NUMBER] pph"
+
+### GOOD EXAMPLES OF BULLETS:
+• "Loop CBS for parcel sorting, employing cross-belt technology, has been designed to handle a throughput of 10,000 packages per hour."
+• "This Loop CBS is equipped with 3 Nos fully automatic induct lines, along with manual loading point."
+• "The system is having its own conveyor connection to transport the volume from primary loading points to the induction zone."
+• "In the system, there are 58 gravity chutes, 70 mini-gravity chutes, 7 rejection chutes, and 1 bulk chute for efficient parcel distribution."
+• "The system layout has been meticulously planned to facilitate smooth operational flow, ensuring efficient movement of personnel."
+
+### BAD EXAMPLES (DO NOT USE):
+• "3 Nos of Feedlines" ❌ (too short, no context)
+• "32 Manual Induct Stations" ❌ (don't count manual stations)
+• "202 generic chutes" ❌ (too vague, add context)
+• "Sorter, based on a cross-belt technology, offers a designed throughput of 1200 pph." ❌ (too short)
+
+### OUTPUT FORMAT
+1. Opening paragraph (all sentences combined into one flowing paragraph)
+2. "Our solution is based on the following key characteristics:" (ONLY ONCE)
+3. 4-6 descriptive bullet points as full sentences
+4. Closing paragraph with tailor-made statement
+5. Dash points for operational simplicity
+6. Fixed sections (Falcon reliability + warranty)
 
 DO NOT ADD ANY EXTRA TEXT OR INFORMATION OR JUSTIFICATION or "Here is an Executive Summary for the proposal:" EXCEPT THE FULL PROPOSAL
 """
-
-# System Description System Prompt
-ENHANCED_SYSTEM_DESCRIPTION_PROMPT = """You are an expert Material Handling System Engineer specializing in Cross-Belt Sorter systems. Your task is to generate COMPREHENSIVE, DETAILED, and EXTENSIVE system descriptions that match the depth and technical detail of professional engineering documentation.
-
-**CRITICAL INSTRUCTIONS:**
-
-1. **USE ONLY PROVIDED INFORMATION:**
-   - Extract ALL information from the process flow input
-   - Extract ALL quantities and specifications from the DXF file information
-   - DO NOT use any values from training examples
-   - DO NOT assume or invent specifications
-
-2. **DXF FILE INTEGRATION:**
-   You will receive DXF file information in JSON format containing:
-   - File name and units
-   - Block counts for components (chutes, operators, leg guards, fencing, pallets, etc.)
-   - Groups with total counts
-   
-   **Use this DXF data to:**
-   - Extract exact quantities for chutes, operators, safety equipment
-   - Include specific counts in relevant sections
-   - Reference the DXF file as the source of layout information
-   - Add details about protection, fencing, and infrastructure based on block counts
-
-3. **SECTION GENERATION - BE EXTREMELY DETAILED:**
-
-   Create sections ONLY for components mentioned in process flow or DXF data. Each section must be COMPREHENSIVE with multiple paragraphs.
-
-   **INFEED SYSTEM** (if mentioned):
-   - Write 4-6 detailed paragraphs
-   - Describe the overall configuration and purpose
-   - Explain each conveyor type in detail (3-4 sentences each):
-     * **Straight Belt Conveyor**: Modular and robust design, used for smooth conveying of products over straight paths. MS profile is used to build conveyor frame. The conveyors are supplied with necessary supports and bolts to fix them to the supporting plane, as well as junction elements allowing easy and jam-free passage from one conveyor to another. Features include low noise, maximum uptime, minimal maintenance, high safety standards, and fastest ROI.
-     * **Inclined PVC Conveyor**: Used for smooth conveying of products over inclined and declined paths. Belt conveyors feature modular design with MS profile construction. Supplied with necessary supports, bolts, and junction elements for seamless integration.
-     * **Buffer Conveyor**: A buffer conveyor, also known as a buffering conveyor or accumulation conveyor, is a type of conveyor system used to temporarily store or hold items in a controlled manner. Its primary purpose is to manage the flow of items between different stages of a production or handling process when there is a mismatch in the speeds or capacities of the upstream and downstream equipment. These conveyors are required to maintain the throughput of the line.
-     * **Curve Conveyor**: Robust and easily maintainable design. The uniquely designed curves and belts provide smooth environment to parcels for making turns. The metal frames of the belts are not deformable to prevent belt misalignment. The belt guide assembly includes removable parts to allow quick replacement in case of damage.
-   - Mention flow path from loading to induct zone
-   - Include general specifications format: Belt material (PVC), load capacity, motor type (AC Geared Motor), gear motor makes, drive makes
-   - Reference total conveyor counts if available from DXF
-
-   **INDUCTION/FEEDLINE SYSTEM** (if mentioned):
-   - Write 5-8 detailed paragraphs
-   - Describe overall feedline configuration
-   - Detail each module type with 3-4 sentences:
-     * **Loading/Receiving Conveyor**: A receiving conveyor is a type of conveyor system used to receive and release the products for induction onto CBS. It serves as the connection point at turn point of entry where products are collected and conveyed to subsequent stages of the process. The receiving conveyor accurately positions parcels for smooth transfer to the main sorter.
-     * **Weighing Conveyor**: A weighing conveyor, also known as a weigh belt conveyor, is a type of conveyor system specifically designed to measure the weight of materials as they move along the conveyor belt. It combines the functions of conveying and weighing into a single integrated process. Weighing conveyors are equipped with high precision load cells to capture the weight of shipments. Makes include Bizerba, Mettler Toledo, or equivalent manufacturers.
-     * **Spacing Conveyor**: A spacing conveyor, also referred to as a gapping conveyor or gap optimizer, is a type of conveyor system used to create and maintain consistent gaps or spacing between items as they move along the conveyor line. Its primary purpose is to regulate the flow and spacing of products to ensure smooth operation and efficient downstream processes. This conveyor is a variable speed special purpose module that creates space between parcels as well as regulates feeding to downstream equipment.
-     * **Buffer Conveyors**: Used to temporarily store or hold items in controlled manner. Primary purpose is to manage flow of items between different stages when there is mismatch in speeds or capacities of upstream and downstream equipment. Required to maintain the throughput of line.
-     * **Angle Merge Conveyor**: An angle/intelligent merge conveyor incorporates advanced automation and control technologies to intelligently merge stream of materials into a single unified flow. It optimizes the merging process by dynamically adjusting the speed and position of items to ensure a smooth and efficient merge. This is typically a 30° triangular high-speed conveyor used for inducting shipments/boxes directly onto the sorter. The belts are strip belts for smooth shipment movement.
-   - Explain sensor placement and functionality
-   - Describe how parcels are prepared and positioned for sorter entry
-   - Include number of feedlines and capacity from process flow
-
-   **MANUAL INDUCT STATIONS** (if mentioned):
-   - Write 2-3 paragraphs
-   - Describe location (ground level, mezzanine)
-   - Explain operator workflow in detail
-   - Mention capacity and number of stations
-   - Include operator count from DXF data if available
-
-   **CROSS-BELT SORTER (Main Sorter)**:
-   - Write 4-6 detailed paragraphs
-   - Describe sorter type (Linear CBS or Loop CBS)
-   - Installation details: height from ground, location
-   - Carrier specifications: type (single/dual belt), pitch, belt dimensions
-   - For Linear: top running length, total length, number of carriers
-   - For Loop: loop circumference, deck configuration
-   - Operation description: How parcels pass through the sorter, barcode scanning process, chute assignment logic, carrier actuation mechanism, discharge process
-   - Explain the sorting sequence step by step
-
-   **BARCODE SCANNING & DIMENSIONING SYSTEM** (if mentioned):
-   - Write 3-4 paragraphs
-   - Scanner type and configuration (5-side, 6-side, top-only)
-   - Technology: ICR (Image Code Reader) or other
-   - Manufacturer and model information
-   - Capabilities: Barcode types (1D, 2D), scanning coverage, orientation
-   - Additional features: Image archiving, dimension measurement accuracy
-   - Integration with WCS and sorting logic
-
-   **OUTPUT CHUTES** - BE VERY DETAILED:
-   - **Use exact quantities from DXF data**
-   - Write 8-12 paragraphs total covering all chute types
-   
-   For each chute type present:
-   
-   **Collection Chutes / Manual Chutes**:
-   - Extract total count from DXF data (look for "chute", "Chute" in block counts)
-   - Write 3-4 paragraphs describing:
-     * Type: Friction roller chute or gravity chute design
-     * Purpose: A friction roller chute is a type of chute used for the smooth descent of materials or objects from an elevated position to a lower level. It utilizes its roller platform to gradually descend and collect the parcel at the end.
-     * Configuration: Single deck or double deck
-     * Capacity calculation with example dimensions
-     * Equipment per chute: Chute full sensors (quantity and function), three-color tower lights/beacon lights (to indicate chute status), push buttons (to start/stop sorting operations)
-   
-   **Live Chutes / Live Dock Chutes** (if mentioned):
-   - Write 2-3 paragraphs
-   - Describe: A live chute refers to a combination of collection chute, PVC belt conveyor, and TBC (if applicable), where the collection chute helps bringing down the sorted parcel and releases it to running conveyor for direct loading into trucks
-   - Configuration and integration with conveyors
-   
-   **Rejection/Technical Chutes** (if mentioned):
-   - Write 2-3 paragraphs
-   - Purpose: Handle rejected, oversized, overweight, no-read parcels
-   - Design and operation
-   - Equipment included
-   
-   **Direct Bagging Chutes** (if applicable):
-   - Write 2-3 paragraphs
-   - Purpose and operation
-   - Integration with bagging system
-
-   **RECIRCULATION & MANUAL REFEED LINE** (if mentioned):
-   - Write 3-4 paragraphs
-   - Recirculation line: Strategically designed at the end of the sorter system to manage parcels that encounter sorting failures. This automated line efficiently gathers and transports the sort-failed parcels, refeeding them back into the sorter system without requiring additional manual labor. The entire process is seamless, ensuring parcels are automatically re-fed into the sorting system.
-   - Manual refeed line: Integration for reintroduction of rejected parcels that have been manually reprocessed. This ensures that manually handled parcels are easily fed back into the sorter, maintaining operational flow and minimizing delays.
-
-   **BAGGING SYSTEM** (if applicable):
-   - Write 3-4 paragraphs
-   - Bagging conveyor configuration
-   - Flow from bagging chutes to bag induct
-   - Bag scanning and induction process
-
-   **SECONDARY SORTING / PALLETIZATION** (if applicable):
-   - Write 2-3 paragraphs
-   - Operator workflow with hand-held terminals
-   - Pallet positioning and dispatch
-   - Include pallet count from DXF data if available
-
-   **TELESCOPIC BELT CONVEYORS** (if applicable):
-   - Write 2-3 paragraphs
-   - Quantity and placement
-   - Technical specifications: base length, extended length, belt specifications
-   - Purpose and operation
-
-   **INFRASTRUCTURE & SUPPORT SYSTEMS**:
-   - Write 6-10 paragraphs covering all infrastructure elements
-   
-   **Mezzanine Platform** (if mentioned):
-   - Total area, clear height, type
-   - Number of staircases
-   - Deck configuration
-   
-   **Safety & Protection**:
-   - **Extract counts from DXF data**:
-     * Leg guards count (look for "leg guard", "Leg Guard" in blocks)
-     * Operator safety guards (look for "operator safety" in blocks)
-     * Fencing (look for "fencing", "Fencing" in blocks)
-   - Write detailed paragraphs: Leg guards are protective components designed to shield the legs from external material or component. Material for leg guards is typically MS (Mild Steel). Operator safety guards protect personnel near the system. Perimeter fencing defines the loading zone and protects personnel.
-   
-   **Pathways**:
-   - Allocated pathways for operator and vehicle movement
-   
-   **System Color Coding** (if applicable):
-   - RAL color codes for different system components
-   
-   **Electrical & Controls Infrastructure**:
-   - Control panels, switch racks, socket provisions
-   - Cable management systems
-   - Communication protocols
-
-   **SYSTEM TECHNICAL SUMMARY**:
-   - Write 3-4 paragraphs summarizing:
-     * Total conveyor system metrics
-     * Feedline configuration and capacity
-     * Sorter specifications
-     * Total chutes by type (use DXF counts)
-     * Operator positions (from DXF)
-     * Infrastructure elements
-     * Key equipment and technologies
-
-4. **TABLE FORMATTING (CRITICAL):**
-   - When you need to present tabular data (e.g., system components, quantities, specifications), use this JSON format:
-   
-   ```json
-   TABLE_START
-   {
-     "title": "Table Title Here",
-     "headers": ["Column1", "Column2", "Column3"],
-     "rows": [
-       ["Row1Col1", "Row1Col2", "Row1Col3"],
-       ["Row2Col1", "Row2Col2", "Row2Col3"]
-     ]
-   }
-   TABLE_END
-   ```
-   
-   - Place this JSON block on its own lines in the output
-   - Do NOT use markdown tables (| --- |), ONLY use the JSON format above
-   - Use tables for: System Components, Quantities from DXF, Specifications, Equipment Lists
-
-5. **WRITING REQUIREMENTS:**
-   - Each major section: 4-8 paragraphs minimum
-   - Each subsection: 2-4 paragraphs minimum
-   - Each component description: 3-5 sentences minimum
-   - Use technical, professional language
-   - Explain functionality, purpose, and integration
-   - Include design rationale where applicable
-   - Maintain consistent technical depth throughout
-   - Use proper material handling terminology
-   - For bold text, use **text** format (it will be rendered bold without asterisks)
-   - **CRITICAL: Always use numeric format for quantities (e.g., 3, 9, 24, 202) instead of words (e.g., three, nine, twenty-four).**
-   - For subsection headings, use the format: ## Heading Text (this will be rendered as numbered subheading)
-   - Do NOT use bullet-star combinations like •	*Heading** for subsections, ONLY use ## format
-
-6. **QUANTITY EXTRACTION FROM DXF:**
-   - Total chutes: Sum all chute-related blocks
-   - Operators: Look for "operator", "Operator" in block names
-   - Leg guards: Look for "leg guard", "Leg Guard"
-   - Fencing: Look for "fencing", "Fencing"
-   - Pallets: Look for "pallet", "Pallet"
-   - Safety equipment: Look for "safety", "gaurd", "guard"
-   - Use these exact numbers in relevant sections
-
-7. **OUTPUT LENGTH TARGET:**
-   - Aim for 3000-5000 words total
-   - Match the depth and detail of professional engineering system descriptions
-   - Every component gets thorough explanation
-   - Multiple paragraphs per major section
-
-**REMEMBER:**
-- Be EXTREMELY detailed and comprehensive
-- Write multiple paragraphs for each section
-- Use exact quantities from DXF data
-- Explain every component thoroughly
-- Match the professional engineering documentation style
-- Generate content that is 5-10 pages when exported to Word
-- Use JSON format for ALL tables (TABLE_START...TABLE_END)"""
 
 # Config paths
 STATIC_ABOUT_DIR = r"Static_AboutCompany"
@@ -2439,6 +3288,85 @@ def add_centered_image(doc, path, width_in=5.5):
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.space_after = Pt(6)
+
+def add_bullets_in_two_columns(doc, bullet_items):
+    """Add bullet points in a two-column layout using a borderless table"""
+    # Split items into two columns
+    mid = (len(bullet_items) + 1) // 2
+    left_items = bullet_items[:mid]
+    right_items = bullet_items[mid:]
+    
+    # Create table with 2 columns - use no style to avoid borders
+    table = doc.add_table(rows=max(len(left_items), len(right_items)), cols=2)
+    
+    # Remove all borders from table using XML manipulation
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement('w:tblPr')
+    
+    # Remove any existing tblBorders element
+    for existing_borders in tblPr.findall(qn('w:tblBorders')):
+        tblPr.remove(existing_borders)
+    
+    # Add new tblBorders with all borders set to none
+    tblBorders = OxmlElement('w:tblBorders')
+    for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+        border = OxmlElement(f'w:{border_name}')
+        border.set(qn('w:val'), 'nil')
+        border.set(qn('w:sz'), '0')
+        border.set(qn('w:space'), '0')
+        border.set(qn('w:color'), 'auto')
+        tblBorders.append(border)
+    tblPr.append(tblBorders)
+    if tbl.tblPr is None:
+        tbl.insert(0, tblPr)
+    
+    # Set column widths
+    table.columns[0].width = Inches(3.25)
+    table.columns[1].width = Inches(3.25)
+    
+    # Fill left column with compact formatting
+    for i, item in enumerate(left_items):
+        cell = table.rows[i].cells[0]
+        # Remove cell borders
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcBorders = OxmlElement('w:tcBorders')
+        for border_name in ['top', 'left', 'bottom', 'right']:
+            border = OxmlElement(f'w:{border_name}')
+            border.set(qn('w:val'), 'nil')
+            tcBorders.append(border)
+        tcPr.append(tcBorders)
+        
+        p = cell.paragraphs[0]
+        p.clear()
+        run = p.add_run(f"• {item}")
+        run.font.name = 'Calibri'
+        run.font.size = Pt(9)  # Slightly smaller for compactness
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.left_indent = Inches(0.05)
+    
+    # Fill right column with compact formatting
+    for i, item in enumerate(right_items):
+        cell = table.rows[i].cells[1]
+        # Remove cell borders
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcBorders = OxmlElement('w:tcBorders')
+        for border_name in ['top', 'left', 'bottom', 'right']:
+            border = OxmlElement(f'w:{border_name}')
+            border.set(qn('w:val'), 'nil')
+            tcBorders.append(border)
+        tcPr.append(tcBorders)
+        
+        p = cell.paragraphs[0]
+        p.clear()
+        run = p.add_run(f"• {item}")
+        run.font.name = 'Calibri'
+        run.font.size = Pt(9)  # Slightly smaller for compactness
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.left_indent = Inches(0.05)
 
 def add_numbered_heading(doc, text, level=1, counter=None):
     """Add a numbered heading with proper formatting"""
@@ -2952,22 +3880,83 @@ def call_groq_cover_letter(
             text = parts[1]
             if text.startswith("text\n") or text.startswith("markdown\n"):
                 text = "\n".join(text.split("\n")[1:])
-    return text.strip()
+    
+    # Apply text normalizations: Cross Belt Sorter capitalization and client name consistency
+    text = normalize_proposal_text(text.strip(), client_name)
+    
+    return text
 
-def call_groq_exec_summary(system_text: str, client_name: str, project_title: str) -> str:
+def call_groq_exec_summary(system_text: str, client_name: str, project_title: str, pph_count: str = "", cbs_type: str = "", dxf_json: dict = None) -> str:
     """Call Groq API to generate the Executive Summary text."""
+    
+    # Build component counts string from DXF data
+    component_counts = ""
+    if dxf_json:
+        cat_summary = dxf_json.get('category_summary', {})
+        chute_analysis = dxf_json.get('chute_analysis', {})
+        categorized = dxf_json.get('categorized_components', {})
+        
+        counts_lines = []
+        
+        # Induct Lines count (feedlines = induct lines)
+        feedline_count = cat_summary.get('AUTO_INDUCT', 0)
+        if feedline_count > 0:
+            counts_lines.append(f"Induct Lines (Automatic): {feedline_count}")
+        
+        # Manual loading - just indicate presence, not count
+        manual_count = cat_summary.get('OPERATOR_STATION', 0)
+        if manual_count > 0:
+            counts_lines.append(f"Manual Loading Point: Present (combine with induct lines bullet)")
+        
+        # Telescopic conveyors
+        telescopic_count = 0
+        for name, count in categorized.get('CONVEYOR_INFEED', {}).items():
+            if 'telescopic' in name.lower() or 'tbc' in name.lower():
+                telescopic_count += count
+        if telescopic_count > 0:
+            counts_lines.append(f"Telescopic Conveyors: {telescopic_count}")
+        
+        # Chutes breakdown - combine in one line
+        if chute_analysis:
+            total_chutes = chute_analysis.get('total', 0)
+            chute_types = chute_analysis.get('breakdown', {})
+            chute_details = []
+            for ctype, ccount in chute_types.items():
+                if ccount > 0:
+                    chute_details.append(f"{ccount} {ctype}")
+            if chute_details:
+                counts_lines.append(f"Chutes: {', '.join(chute_details)} (Total: {total_chutes})")
+            elif total_chutes > 0:
+                counts_lines.append(f"Total Chutes: {total_chutes}")
+        
+        if counts_lines:
+            component_counts = "\n".join(counts_lines)
+    
     user_content = (
         f"Client Name: {client_name}\n"
-        f"Project / System Name: {project_title}\n\n"
+        f"Project / System Name: {project_title}\n"
+        f"PPH (Throughput): {pph_count if pph_count else 'Not specified'}\n"
+        f"CBS Type: {cbs_type if cbs_type else 'Cross-belt technology'}\n\n"
+    )
+    
+    if component_counts:
+        user_content += f"COMPONENT COUNTS FROM DXF:\n{component_counts}\n\n"
+    
+    user_content += (
         f"Proposed System Description (for context):\n{system_text}\n\n"
-        "Generate the Executive Summary strictly as per the instructions."
+        "Generate the Executive Summary strictly as per the instructions.\n"
+        "**CRITICAL:** Write 'Our solution is based on the following key characteristics:' only ONCE.\n"
+        "**CRITICAL:** Each bullet must be a FULL SENTENCE with context, not just item names.\n"
+        "**CRITICAL:** Do NOT count manual stations separately - mention as 'manual loading point' in induct bullet.\n"
+        "**CRITICAL:** Combine induct lines + manual loading in ONE bullet.\n"
+        "**CRITICAL:** Combine all chute types in ONE bullet with counts."
     )
 
     def api_call():
         return groq_client.chat.completions.create(
             model="groq/compound",
             temperature=0.4,
-            max_tokens=800,
+            max_tokens=1200,
             messages=[
                 {"role": "system", "content": EXEC_SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
@@ -2975,68 +3964,64 @@ def call_groq_exec_summary(system_text: str, client_name: str, project_title: st
         )
     
     resp = call_groq_with_retry(api_call)
-    return resp.choices[0].message.content.strip()
-
-def call_groq_for_system_description(process_flow: str, dxf_json: dict, project_name: str) -> str:
-    """Generate comprehensive system description using Groq API"""
-    # Convert DXF JSON to string for prompt
-    dxf_info = json.dumps(dxf_json, indent=2, ensure_ascii=False)
+    summary_text = resp.choices[0].message.content.strip()
     
-    user_prompt = f"""Generate a COMPREHENSIVE, DETAILED system description for:
-
-PROJECT NAME: {project_name}
-
-PROCESS FLOW:
-{process_flow}
-
-DXF FILE INFORMATION:
-{dxf_info}
-
-REQUIREMENTS:
-1. Extract ALL quantities from the DXF data (chutes, operators, leg guards, fencing, pallets)
-2. Use these exact numbers in the appropriate sections
-3. Generate EXTENSIVE descriptions for each component (multiple paragraphs), Add Table if needed.
-4. Only include sections for components mentioned in process flow or present in DXF data
-5. Write 2000-3000 words with technical depth matching professional engineering documentation
-6. Each major section should have 3-4 paragraphs with subsections having 2-4 paragraphs
-7. Each component description should have 3-5 sentences explaining functionality, design, and purpose
-8. Each subheading will be in bold format example: **Conveyor System**
-9. Do NOT ADD ```json`` or any other code block formatting in the output
-
-Generate the detailed system description now."""
-
-    def api_call():
-        return groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": ENHANCED_SYSTEM_DESCRIPTION_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.3,
-            max_tokens=3000,
-            top_p=0.9
-        )
+    # Apply text normalizations: Cross Belt Sorter capitalization and client name consistency
+    summary_text = normalize_proposal_text(summary_text, client_name)
     
-    resp = call_groq_with_retry(api_call)
-    return resp.choices[0].message.content.strip()
+    return summary_text
 
 
-def generate_system_description_from_sd_sys(dxf_path: Path, costing_file_upload, project_name: str,
-                                           client_name: str = "", pph_count: str = "", ipp_rate: str = "") -> tuple[str, dict, dict, dict]:
-    """
-    Wrapper that uses `sys_desc_latest.py` functionality to generate a final System Description text.
+# System prompt used for extracting price-sheet JSON from costing CSV
+PRICE_SHEET_SYSTEM_PROMPT = """
+You are a senior commercial analyst for warehouse automation projects.
 
-    Returns a tuple: (system_description_text, detected, tables, cost_vals)
-        # NOTE: System Description section replaced by sys_desc_latest integration.
-        # The legacy formatting/LLM output parsing was removed so the sys_desc_latest
-        # pipeline (called elsewhere) will supply `system_description_text` and
-        # that text will be added into the main document using the new flow.
+You receive the contents of an Excel sheet called "Overall Costing" as raw CSV text.
+This sheet may contain many detailed costing lines, intermediate totals, taxes, and notes.
+
+Your job is to infer the HIGH-LEVEL "Price Sheet" summary used in proposals.
+
+The high-level Price Sheet is a short table of a few summary lines (typically 3–15),
+each corresponding to a major package/component of the solution with a single rolled-up price.
+Do NOT list detailed items like small sub-components or line-by-line BOM;
+only show the SUMMARY building blocks that a customer would see in the commercial section.
+
+------------------------------------------------
+EXAMPLES OF TARGET PRICE SHEETS (FOR REFERENCE)
+------------------------------------------------
+
+Example 1 –
+
+Price List- Summary
+S.NO   Package                    Price
+1      Conveyors Package          ₹ 28,34,27,926
+2      Cross Belt Sorter Package  ₹ 29,16,52,094
+3      Destinations Package       ₹ 3,83,87,721
+4      Services Package           ₹ 3,46,22,786
+       Total                      ₹ 64,80,90,527
+
+"Business Cooperation Agreement"
+Discount for Delhivery  4.5%
+Final Total             ₹ 61,89,26,453
+
+
+Example 2 – 
+
+Price Sheet
+S. No   Component                               Price (USD)
+1       Loop CBS + Inducts                      (included or price)
+2       Infeed + Bagging Conveyors             $ 398,105
+3       Output Chutes                          $ 219,944
+4       Software Package & Integration         $ 26,302
+5       Packaging & forwarding                 $ 3,523
+6       Project Management + Supervision cost  $ 32,268
+Total (USD)                                    $ 726,386
+
+---------------------------------------
+TASK – WHAT YOU MUST RETURN
+---------------------------------------
+
+Use the raw 'Overall Costing' CSV to reconstruct ONLY the high-level summary.
 
 1) Identify the main commercial building blocks, such as:
    - Conveyors Package
@@ -3060,20 +4045,16 @@ def generate_system_description_from_sd_sys(dxf_path: Path, costing_file_upload,
    - label: the package/component name in clean human-readable form
    - price: the final total price for that component AS A STRING,
             including currency symbol and formatting exactly as in the sheet
-            (e.g. "₹ 28,34,27,926", "SAR 10,959,208", "$ 398,105", "€ 2,871,416", "Included in CBS Price").
 
    IMPORTANT:
    - Do NOT invent prices.
    - Use values that actually appear in the sheet.
-   - If multiple detailed rows roll up into one package, use the rolled-up total that clearly corresponds to that package.
-   - Prefer the same format as used for the final summary in the data, if visible.
+   - If multiple detailed rows roll up into one package, use the rolled-up total.
 
-3) If there is a grand "Total" (for the whole solution), also return:
+3) If there is a grand "Total", also return:
    - total_row: { "label": "...", "price": "..." }
-   For example: { "label": "Total", "price": "₹ 64,80,90,527" }.
-   If no obvious total exists, set total_row to null.
 
-4) If there are explicit discount and final total lines (like in the Delhivery example):
+4) If there are explicit discount and final total lines:
    - cooperation_label: e.g. "Business Cooperation Agreement"
    - discount_label: e.g. "Discount for Delhivery"
    - discount_value: e.g. "4.5%"
@@ -3083,10 +4064,9 @@ def generate_system_description_from_sd_sys(dxf_path: Path, costing_file_upload,
 
 5) Also return:
    - currency: "INR", "SAR", "USD", "EUR", or "MIXED" if multiple currencies appear.
-   - price_sheet_title: a short label like "19.1 Price List – Summary" or "20.1 Price Sheet"
-                        if visible; otherwise null.
+   - price_sheet_title: a short label like "Price List – Summary" or "Price Sheet"
 
-6) OUTPUT FORMAT (VERY IMPORTANT):
+6) OUTPUT FORMAT:
 
 Return ONLY a single valid JSON object with this exact shape:
 
@@ -3112,20 +4092,12 @@ Return ONLY a single valid JSON object with this exact shape:
   "final_total_value": "string or null"
 }
 
-Do NOT wrap the JSON or ```json``` in markdown.
+Do NOT wrap the JSON in markdown code fences.
 Do NOT add explanations or commentary.
 Just return the JSON object.
 """
 
-# System prompt used for extracting price-sheet JSON from costing CSV
-GROQ_SYSTEM_PROMPT = """
-You are an expert data extraction assistant. You will be given a CSV-like dump of an internal costing sheet.
-Your job is to extract and return a single valid JSON object exactly matching the schema requested by the user.
-Return ONLY the JSON object and nothing else. Do not include markdown, commentary or any extra text.
-If a field is missing, set it to null. Be strict about types.
-"""
-
-GROQ_USER_PROMPT_TEMPLATE = """
+PRICE_SHEET_USER_PROMPT_TEMPLATE = """
 Below is the raw CSV export of the 'Overall Costing' sheet of an internal costing file.
 
 Use it to construct the high-level Price Sheet summary as described in the instructions.
@@ -3138,13 +4110,13 @@ Raw CSV:
 
 def call_groq_for_price_sheet(sheet_csv: str) -> dict:
     """Call Groq API to extract price sheet from costing CSV"""
-    user_prompt = GROQ_USER_PROMPT_TEMPLATE.format(sheet_csv=sheet_csv)
+    user_prompt = PRICE_SHEET_USER_PROMPT_TEMPLATE.format(sheet_csv=sheet_csv)
 
     def api_call():
         return groq_client.chat.completions.create(
-            model="groq/compound",
+            model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                {"role": "system", "content": PRICE_SHEET_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.0,
@@ -3687,137 +4659,8 @@ else:
 
 st.markdown("---")
 
-# Section 2.5: Process Flow Preview & Feedback (only if DXF is uploaded)
-if dxf_layout_file:
-    render_section_header("Section 2.5: Process Flow Preview & Feedback")
-    
-    with st.expander("🔄 Preview & Refine Process Flow", expanded=False):
-        st.markdown("""
-        **Quick Preview & Feedback Loop**
-        
-        Generate a preview of the process flow from your DXF file. If you're not satisfied with the output, 
-        provide feedback and regenerate until it meets your requirements.
-        """)
-        
-        col_preview1, col_preview2 = st.columns([3, 1])
-        
-        with col_preview1:
-            if st.button("🚀 Generate Process Flow Preview", key="generate_preview", width='stretch'):
-                with st.spinner("Generating process flow preview..."):
-                    try:
-                        # Create temp directory and process DXF
-                        tmp_dir = Path(tempfile.mkdtemp(prefix="preview_"))
-                        dxf_path = tmp_dir / dxf_layout_file.name
-                        dxf_path.write_bytes(dxf_layout_file.getvalue())
-                        
-                        # Extract DXF components
-                        dxf_json = extract_dxf_components(dxf_path, project_name)
-                        
-                        # Call the refactored function to get process flow and iteration details
-                        final_flow, iteration_details = call_groq_for_process_flow(client_name, project_name, dxf_json)
-                        
-                        # Save preview in session state
-                        st.session_state['preview_process_flow'] = final_flow
-                        st.session_state['iteration_details'] = iteration_details
-                        
-                        st.success("✅ Process Flow generated successfully!")
-                        
-                        # Display Iteration Details Expander
-                        with st.expander("📊 Iteration Details & Scores (Process Flow Evolution)", expanded=True):
-                            if iteration_details:
-                                st.markdown("### 🔄 Refinement Process Summary")
-                                
-                                # Show INITIAL flow first
-                                st.markdown("#### **Initial Process Flow**")
-                                if iteration_details:
-                                    initial_detail = iteration_details[0]
-                                    st.markdown(f"**Score:** {initial_detail['score']:.2f} / {initial_detail['target_score']}")
-                                    st.markdown("**Flow:**")
-                                    st.text_area("Initial Flow", value=initial_detail['flow'], height=250, 
-                                                disabled=False, key="initial_flow_display")
-                                
-                                st.markdown("---")
-                                st.markdown("### 📈 Iteration-by-Iteration Refinement")
-                                
-                                # Show each iteration with full flow
-                                for detail in iteration_details:
-                                    iteration_num = detail['iteration']
-                                    score = detail['score']
-                                    target = detail['target_score']
-                                    gap = detail['gap']
-                                    flow = detail['flow']
-                                    feedback = detail['feedback']
-                                    
-                                    # Create expander for each iteration
-                                    is_success = score >= target
-                                    status_icon = "✅" if is_success else "🔄"
-                                    
-                                    with st.expander(f"{status_icon} Iteration {iteration_num} | Score: {score:.2f}/{target} | Gap: {gap:.2f}"):
-                                        col1, col2, col3 = st.columns(3)
-                                        with col1:
-                                            st.metric("Coherence Score", f"{score:.2f}")
-                                        with col2:
-                                            st.metric("Target Score", f"{target:.1f}")
-                                        with col3:
-                                            st.metric("Gap", f"{gap:.2f}")
-                                        
-                                        # Show feedback items if any
-                                        if feedback:
-                                            st.markdown("**💡 Feedback Applied:**")
-                                            for i, fb in enumerate(feedback, 1):
-                                                st.write(f"**{i}.** {fb}")
-                                        else:
-                                            st.info("✨ No feedback generated (already matches target)")
-                                        
-                                        # Show full process flow
-                                        st.markdown("**📄 Process Flow:**")
-                                        st.text_area(f"Flow_{iteration_num}", value=flow, height=300, 
-                                                    disabled=False, key=f"flow_iter_{iteration_num}")
-                                
-                                # Summary table
-                                st.markdown("---")
-                                st.markdown("### 📊 Summary Table")
-                                summary_data = []
-                                for detail in iteration_details:
-                                    status = "✅ Success" if detail['score'] >= detail['target_score'] else "🔄 Refining"
-                                    summary_data.append({
-                                        "Iteration": detail['iteration'],
-                                        "Score": f"{detail['score']:.2f}",
-                                        "Target": f"{detail['target_score']:.1f}",
-                                        "Status": status,
-                                        "Gap": f"{detail['gap']:.2f}",
-                                        "Feedback Items": len(detail['feedback'])
-                                    })
-                                
-                                import pandas as pd
-                                df_summary = pd.DataFrame(summary_data)
-                                st.dataframe(df_summary, use_container_width=True, hide_index=True)
-                            else:
-                                st.info("No iteration details available")
-                        
-                        st.markdown("---")
-                        st.markdown("### 🏆 Final Process Flow (Best Iteration)")
-                        
-                        # Find best iteration details for context
-                        best_iteration_detail = None
-                        best_score = 0
-                        for detail in iteration_details:
-                            if detail['score'] > best_score:
-                                best_score = detail['score']
-                                best_iteration_detail = detail
-                        
-                        if best_iteration_detail:
-                            st.markdown(f"**Best Score Achieved:** {best_iteration_detail['score']:.2f} / {best_iteration_detail['target_score']}")
-                            st.markdown(f"**Achieved in Iteration:** {best_iteration_detail['iteration']}")
-                        
-                        st.markdown("**Optimized Process Flow:**")
-                        st.code(final_flow)
-                    except Exception as e:
-                        st.error(f"Failed to generate process flow preview: {e}")
-                        try:
-                            st.exception(e)
-                        except Exception:
-                            pass
+# Section 2.5: Process Flow Preview & Feedback - REMOVED
+# Process flow generation now happens during "Generate Final Docx" using agentY agentic solution
 
 key_include = True
 safety_include = True
@@ -3832,6 +4675,7 @@ include_proposed_system = True
 include_concept_desc = True
 include_exec_summary = True
 include_company_profile = True
+include_reference_projects = True
 include_handled_spectrum = True
 include_capacity_section = True
 elec_include = True
@@ -3911,195 +4755,7 @@ with st.expander("📜 Warranty Configuration", expanded=False):
     else:
         warranty_transport_text = None
 
-with st.expander("🎯 Feedback Rules Management", expanded=False):
-    st.markdown("""
-    **Manage Process Flow Feedback Rules**
-    
-    **🌍 Global Rules:** Saved permanently in `feedback_rules.json`, applied to ALL projects across all sessions  
-    **📍 Local Rules:** Temporary, stored in current session only, disappear when you close the app
-    """)
-    
-    # Get global rules
-    all_global_rules = get_all_rules()
-    
-    # Get local rules from session
-    local_rules = st.session_state.get('local_feedback_rules', [])
-    
-    # Get statistics
-    stats = get_rule_stats()
-    
-    # Display tabs for Global vs Local
-    tab_global, tab_local, tab_stats = st.tabs(["🌍 Global Rules", "📍 Local Rules", "📊 Statistics"])
-    
-    with tab_global:
-        if not all_global_rules:
-            st.info("No global rules saved yet. Create your first permanent rule from the preview section!")
-        else:
-            st.markdown(f"**Total Global Rules:** {len(all_global_rules)} | **Active:** {sum(1 for r in all_global_rules if r.get('active', True))}")
-            st.markdown("---")
-            
-            # Display global rules
-            for idx, rule in enumerate(all_global_rules):
-                rule_id = rule.get("id", f"rule_{idx}")
-                rule_type = rule.get("type", "global")
-                is_active = rule.get("active", True)
-                timestamp = rule.get("timestamp", "Unknown")
-                user_fb = rule.get("user_feedback", "No feedback")
-                rule_text = rule.get("rule", "No rule extracted")
-                projects = rule.get("applied_to_projects", [])
-                
-                # Create a container for each rule
-                status_emoji = "✅" if is_active else "🔴"
-                type_badge = "🌍" if rule_type == "global" else "📍"
-                
-                with st.container():
-                    col_rule1, col_rule2 = st.columns([4, 1])
-                    
-                    with col_rule1:
-                        st.markdown(f"### {status_emoji} {type_badge} Rule ID: `{rule_id}`")
-                        st.markdown(f"**Created:** {timestamp[:10] if len(timestamp) > 10 else timestamp}")
-                        
-                        if projects:
-                            st.markdown(f"**Applied to:** {', '.join(projects[:3])}{' and more...' if len(projects) > 3 else ''}")
-                        
-                        with st.expander("📝 View Details", expanded=False):
-                            st.markdown("**Original User Feedback:**")
-                            st.text_area(f"Feedback_{rule_id}", value=user_fb, height=80, disabled=True, key=f"fb_{rule_id}", label_visibility="collapsed")
-                            
-                            st.markdown("**Extracted Rule:**")
-                            
-                            # Allow editing if active
-                            if is_active:
-                                new_rule = st.text_area(
-                                    f"Rule_{rule_id}",
-                                    value=rule_text,
-                                    height=100,
-                                    key=f"rule_edit_{rule_id}",
-                                    label_visibility="collapsed"
-                                )
-                                
-                                if new_rule != rule_text:
-                                    if st.button(f"💾 Update Rule", key=f"update_{rule_id}"):
-                                        if update_rule(rule_id, new_rule):
-                                            st.success(f"Rule {rule_id} updated!")
-                                            st.rerun()
-                                        else:
-                                            st.error("Failed to update rule")
-                            else:
-                                st.text_area(f"Rule_{rule_id}", value=rule_text, height=100, disabled=True, key=f"rule_view_{rule_id}", label_visibility="collapsed")
-                    
-                    with col_rule2:
-                        st.markdown("**Actions:**")
-                        
-                        if is_active:
-                            if st.button(f"🔴 Deactivate", key=f"deactivate_{rule_id}", width='stretch'):
-                                if deactivate_rule(rule_id):
-                                    st.success(f"Rule {rule_id} deactivated")
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to deactivate")
-                        else:
-                            st.info("Inactive")
-                    
-                    st.markdown("---")
-    
-    with tab_local:
-        if not local_rules:
-            st.info("No local rules for this session. Create temporary rules from the preview section!")
-        else:
-            st.markdown(f"**Total Local Rules:** {len(local_rules)} | **Active:** {sum(1 for r in local_rules if r.get('active', True))}")
-            st.warning("⚠️ **Note:** Local rules disappear when you close the app. Save as Global if you want to keep them!")
-            st.markdown("---")
-            
-            # Display local rules
-            for idx, rule in enumerate(local_rules):
-                rule_id = rule.get("id", f"lrule_{idx}")
-                is_active = rule.get("active", True)
-                timestamp = rule.get("timestamp", "Unknown")
-                user_fb = rule.get("user_feedback", "No feedback")
-                rule_text = rule.get("rule", "No rule extracted")
-                projects = rule.get("applied_to_projects", [])
-                
-                status_emoji = "✅" if is_active else "🔴"
-                
-                with st.container():
-                    col_rule1, col_rule2 = st.columns([4, 1])
-                    
-                    with col_rule1:
-                        st.markdown(f"### {status_emoji} 📍 Local Rule: `{rule_id}`")
-                        st.markdown(f"**Created:** {timestamp[:10] if len(timestamp) > 10 else timestamp}")
-                        st.markdown(f"**Project:** {projects[0] if projects else 'N/A'}")
-                        
-                        with st.expander("📝 View Details", expanded=False):
-                            st.markdown("**Original User Feedback:**")
-                            st.text_area(f"Local_Feedback_{idx}", value=user_fb, height=80, disabled=True, key=f"lfb_{idx}", label_visibility="collapsed")
-                            
-                            st.markdown("**Extracted Rule:**")
-                            st.text_area(f"Local_Rule_{idx}", value=rule_text, height=100, disabled=True, key=f"lrule_view_{idx}", label_visibility="collapsed")
-                    
-                    with col_rule2:
-                        st.markdown("**Actions:**")
-                        
-                        if st.button(f"🗑️ Remove", key=f"remove_local_{idx}", width='stretch'):
-                            local_rules.pop(idx)
-                            st.session_state['local_feedback_rules'] = local_rules
-                            st.success("Local rule removed")
-                            st.rerun()
-                        
-                        if st.button(f"🌍 Make Global", key=f"promote_{idx}", width='stretch'):
-                            # Save as global rule
-                            rule_id_new = save_feedback_rule(user_fb, rule_text, projects[0] if projects else "Promoted", rule_type="global")
-                            # Remove from local
-                            local_rules.pop(idx)
-                            st.session_state['local_feedback_rules'] = local_rules
-                            st.success(f"Promoted to global rule: {rule_id_new}")
-                            st.rerun()
-                    
-                    st.markdown("---")
-    
-    with tab_stats:
-        st.markdown("### 📊 Rule Statistics")
-        
-        col_stat1, col_stat2, col_stat3 = st.columns(3)
-        
-        with col_stat1:
-            st.metric("Total Global Rules", stats.get("total", 0))
-            st.metric("Active Global", stats.get("active", 0))
-        
-        with col_stat2:
-            st.metric("Inactive Global", stats.get("inactive", 0))
-            st.metric("Local Rules (Session)", len(local_rules))
-        
-        with col_stat3:
-            total_projects = len(set(p for r in all_global_rules for p in r.get("applied_to_projects", [])))
-            st.metric("Projects Using Rules", total_projects)
-            st.metric("Total Rules (G+L)", stats.get("total", 0) + len(local_rules))
-        
-        st.markdown("---")
-        st.markdown("**📈 Rule Breakdown:**")
-        
-        if all_global_rules or local_rules:
-            rule_data = {
-                "Type": ["Global Active", "Global Inactive", "Local Active"],
-                "Count": [
-                    stats.get("active", 0),
-                    stats.get("inactive", 0),
-                    len([r for r in local_rules if r.get("active", True)])
-                ]
-            }
-            st.bar_chart(pd.DataFrame(rule_data).set_index("Type"))
-        else:
-            st.info("No rules created yet. Start generating process flows to build your rule base!")
-        
-        st.markdown("---")
-        st.markdown("**💡 Tips:**")
-        st.markdown("""
-        - **Global rules** are best for organization-wide standards
-        - **Local rules** are perfect for project-specific tweaks
-        - Promote local rules to global if they're universally useful
-        - Deactivate rules instead of deleting to preserve history
-        - Review and clean up rules monthly for best performance
-        """)
+st.markdown("---")
 
 with st.expander("🚫 Exclusions Configuration", expanded=False):
     st.write("**Select Exclusions to Include:**")
@@ -4404,6 +5060,8 @@ def build_executive_summary_section(doc, exec_summary_text, counter):
     add_numbered_heading(doc, "Executive Summary", counter=counter)
     
     lines = exec_summary_text.strip().splitlines()
+    first_bullet_encountered = False  # Track if we've seen the first bullet point
+    
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -4412,6 +5070,9 @@ def build_executive_summary_section(doc, exec_summary_text, counter):
         
         # Check if it's a bullet point line
         if stripped.startswith("•") or stripped.startswith("-"):
+            # Add the key characteristics line before the FIRST bullet point
+            
+            
             bullet_text = stripped.lstrip("•- ").strip()
             p = doc.add_paragraph(style='List Bullet')
             if "**" in bullet_text:
@@ -4621,16 +5282,15 @@ def build_reference_projects_section(doc, counter):
         "High Availability Server Systems.",
         "WCS.",
     ]
-    for t in ktm1:
-        p = doc.add_paragraph(t, style='List Bullet')
-        apply_normal_style(p)
+    add_bullets_in_two_columns(doc, ktm1)
 
     p = doc.add_paragraph()
     run = p.add_run("Site Pictures –")
     run.bold = True
     apply_normal_style(p)
+    p.paragraph_format.keep_with_next = True  # Keep with image
     
-    add_centered_image(doc, "FIXED_IMAGE\\proj1.PNG")
+    add_centered_image(doc, "FIXED_IMAGE\\proj1.PNG", width_in=4.0)
 
     doc.add_page_break()
 
@@ -4683,16 +5343,15 @@ def build_reference_projects_section(doc, counter):
         "Bag Take-out System.",
         "WCS Software System.",
     ]
-    for t in ktm2:
-        p = doc.add_paragraph(t, style='List Bullet')
-        apply_normal_style(p)
+    add_bullets_in_two_columns(doc, ktm2)
 
     p = doc.add_paragraph()
     run = p.add_run("Site Pictures –")
     run.bold = True
     apply_normal_style(p)
+    p.paragraph_format.keep_with_next = True  # Keep with image
     
-    add_centered_image(doc, "FIXED_IMAGE\\proj2.PNG")
+    add_centered_image(doc, "FIXED_IMAGE\\proj2.PNG", width_in=4.0)
 
     doc.add_page_break()
 
@@ -4740,16 +5399,15 @@ def build_reference_projects_section(doc, counter):
         "Bag Take-out System.",
         "WCS Software System.",
     ]
-    for t in ktm3:
-        p = doc.add_paragraph(t, style='List Bullet')
-        apply_normal_style(p)
+    add_bullets_in_two_columns(doc, ktm3)
 
     p = doc.add_paragraph()
     run = p.add_run("Site Pictures –")
     run.bold = True
     apply_normal_style(p)
+    p.paragraph_format.keep_with_next = True  # Keep with image
     
-    add_centered_image(doc, "FIXED_IMAGE\\proj3.PNG")
+    add_centered_image(doc, "FIXED_IMAGE\\proj3.PNG", width_in=4.0)
 
     doc.add_page_break()
 
@@ -4791,16 +5449,15 @@ def build_reference_projects_section(doc, counter):
         "Loop Cross Belt Sorter.",
         "WCS Software System.",
     ]
-    for t in ktm4:
-        p = doc.add_paragraph(t, style='List Bullet')
-        apply_normal_style(p)
+    add_bullets_in_two_columns(doc, ktm4)
 
     p = doc.add_paragraph()
     run = p.add_run("Site Picture –")
     run.bold = True
     apply_normal_style(p)
+    p.paragraph_format.keep_with_next = True  # Keep with image
     
-    add_centered_image(doc, "FIXED_IMAGE\\proj4.PNG")
+    add_centered_image(doc, "FIXED_IMAGE\\proj4.PNG", width_in=4.0)
 
     doc.add_page_break()
 
@@ -4844,16 +5501,15 @@ def build_reference_projects_section(doc, counter):
         "Loop Cross Belt Sorter.",
         "WCS Software System.",
     ]
-    for t in ktm5:
-        p = doc.add_paragraph(t, style='List Bullet')
-        apply_normal_style(p)
+    add_bullets_in_two_columns(doc, ktm5)
 
     p = doc.add_paragraph()
     run = p.add_run("Site Picture –")
     run.bold = True
     apply_normal_style(p)
+    p.paragraph_format.keep_with_next = True  # Keep with image
     
-    add_centered_image(doc, "FIXED_IMAGE\\proj5.PNG")
+    add_centered_image(doc, "FIXED_IMAGE\\proj5.PNG", width_in=4.0)
 
 
 def build_handled_spectrum_section(doc, counter, project_name, client_name):
@@ -4952,9 +5608,13 @@ def build_handled_spectrum_section(doc, counter, project_name, client_name):
         "tape, textile, and wood).",
     ]
     
-    for text in bullets_52:
-        p = doc.add_paragraph(text, style="List Number 2")
-        apply_normal_style(p)
+    # Add bullets with manual numbering to ensure restart at 1
+    for idx, text in enumerate(bullets_52, start=1):
+        p = doc.add_paragraph()
+        run = p.add_run(f"{idx}. {text}")
+        run.font.name = "Calibri"
+        run.font.size = Pt(11)
+        p.paragraph_format.left_indent = Inches(0.25)
 
     # Subsection 3
     add_numbered_subheading(doc, f"{item_plural_cap} not loadable on the sorter", f"{counter}.3")
@@ -4976,9 +5636,13 @@ def build_handled_spectrum_section(doc, counter, project_name, client_name):
         "wrap foil etc. are designated as non-conveyable items.",
     ]
     
-    for text in bullets_53:
-        p = doc.add_paragraph(text, style="List Number 2")
-        apply_normal_style(p)
+    # Add bullets with manual numbering to ensure restart at 1
+    for idx, text in enumerate(bullets_53, start=1):
+        p = doc.add_paragraph()
+        run = p.add_run(f"{idx}. {text}")
+        run.font.name = "Calibri"
+        run.font.size = Pt(11)
+        p.paragraph_format.left_indent = Inches(0.25)
 
 
 def build_description_of_components_section(doc, counter, sorter_spec: dict | None):
@@ -6355,26 +7019,36 @@ def build_exclusions_section(doc, counter, selected_exclusions):
         p = doc.add_paragraph(item, style='List Bullet')
         apply_normal_style(p)
 
-def build_proposed_system_technical_details_section(doc, counter, bom_json):
-    """Build Proposed System Technical Details section with 3 subsections"""
+def build_proposed_system_technical_details_section(doc, counter, mechanical_bom_items=None, bom_json=None):
+    """
+    Build Proposed System Technical Details section with 3 subsections:
+    - Mechanical equipment: from mechanical_bom_items (Groq API extraction)
+    - Electrical Equipment: from bom_json (Groq API)
+    - Control System: from bom_json (Groq API)
+    
+    Args:
+        doc: python-docx Document object
+        counter: Section number counter
+        mechanical_bom_items: List of dicts with pos, qty, description, value (from Groq)
+        bom_json: Dict with sections for Electrical Equipment and Control System (from Groq)
+    """
     doc.add_page_break()
     
     add_numbered_heading(doc, "Proposed System Technical Details", counter=counter)
     
-    if not bom_json or "sections" not in bom_json:
+    has_mechanical = mechanical_bom_items is not None and len(mechanical_bom_items) > 0
+    has_electrical_control = bom_json and "sections" in bom_json
+    
+    if not has_mechanical and not has_electrical_control:
         p = doc.add_paragraph("No technical details available.")
         apply_normal_style(p)
         return
     
     section_number = 1
-    for section in bom_json.get("sections", []):
-        title = section.get("title", "")
-        items = section.get("items", [])
-        if not items:
-            continue
-        
-        # Add subsection heading (e.g., "14.1 Mechanical equipment")
-        add_numbered_subheading(doc, title, f"{counter}.{section_number}")
+    
+    # --- 1. Mechanical equipment (from Groq API) ---
+    if has_mechanical:
+        add_numbered_subheading(doc, "Mechanical equipment", f"{counter}.{section_number}")
         section_number += 1
         
         # Create table with 4 columns: Pos., Qty., Description, Value
@@ -6399,23 +7073,25 @@ def build_proposed_system_technical_details_section(doc, counter, bom_json):
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
         
-        # Add data rows
-        for item in items:
+        # Add data rows from list of items
+        for item in mechanical_bom_items:
             row = table.add_row().cells
             
-            # Pos.
+            # Pos - convert to string
             row[0].text = str(item.get("pos", ""))
             
-            # Qty.
-            row[1].text = item.get("qty") or ""
+            # Qty - convert to string
+            row[1].text = str(item.get("qty", ""))
             
-            # Description (multiple lines)
-            desc_lines = item.get("description_lines") or []
-            row[2].text = "\n".join(desc_lines)
+            # Description - handle newlines (may come as \n or actual newlines)
+            desc = str(item.get("description", ""))
+            desc = desc.replace("\\n", "\n")  # Convert escaped newlines
+            row[2].text = desc
             
-            # Value (multiple lines)
-            value_lines = item.get("value_lines") or []
-            row[3].text = "\n".join(value_lines)
+            # Value - handle newlines
+            val = str(item.get("value", ""))
+            val = val.replace("\\n", "\n")  # Convert escaped newlines
+            row[3].text = val
             
             # Format each cell
             for cell in row:
@@ -6433,10 +7109,86 @@ def build_proposed_system_technical_details_section(doc, counter, bom_json):
         
         # Add spacing after table
         doc.add_paragraph()
+    
+    # --- 2. Electrical Equipment and Control System (from Groq bom_json) ---
+    if has_electrical_control:
+        for section in bom_json.get("sections", []):
+            title = section.get("title", "")
+            items = section.get("items", [])
+            
+            # Skip "Mechanical equipment" section - we use separate Groq call for that
+            if "mechanical" in title.lower():
+                continue
+            
+            if not items:
+                continue
+            
+            # Add subsection heading (e.g., "14.2 Electrical Equipment")
+            add_numbered_subheading(doc, title, f"{counter}.{section_number}")
+            section_number += 1
+            
+            # Create table with 4 columns: Pos., Qty., Description, Value
+            table = doc.add_table(rows=1, cols=4)
+            apply_table_style(table)
+            table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            
+            # Header row
+            hdr = table.rows[0].cells
+            hdr[0].text = "Pos."
+            hdr[1].text = "Qty."
+            hdr[2].text = "Description"
+            hdr[3].text = "Value"
+            
+            # Format header row
+            for cell in hdr:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.name = 'Calibri'
+                        run.font.size = Pt(11)
+                        run.font.bold = True
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            
+            # Add data rows
+            for item in items:
+                row = table.add_row().cells
+                
+                # Pos.
+                row[0].text = str(item.get("pos", ""))
+                
+                # Qty.
+                row[1].text = item.get("qty") or ""
+                
+                # Description (multiple lines)
+                desc_lines = item.get("description_lines") or []
+                row[2].text = "\n".join(desc_lines)
+                
+                # Value (multiple lines)
+                value_lines = item.get("value_lines") or []
+                row[3].text = "\n".join(value_lines)
+                
+                # Format each cell
+                for cell in row:
+                    for paragraph in cell.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.name = 'Calibri'
+                            run.font.size = Pt(11)
+                    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            
+            # Set column widths
+            table.columns[0].width = Inches(0.5)
+            table.columns[1].width = Inches(1.2)
+            table.columns[2].width = Inches(3.5)
+            table.columns[3].width = Inches(1.3)
+            
+            # Add spacing after table
+            doc.add_paragraph()
 
 def build_proposed_system_description_section(doc, counter, client_name, project_name, 
-                                              process_flow_text, layout_png_path):
-    """Build Proposed System Description section (5.0)"""
+                                              process_flow_text, layout_png_path,
+                                              system_description_text=None,
+                                              costing_file=None):
+    """Build Proposed System Description section (5.0) with all subsections"""
     doc.add_page_break()
     
     add_numbered_heading(doc, "Proposed System Description", counter=counter)
@@ -6474,24 +7226,128 @@ def build_proposed_system_description_section(doc, counter, client_name, project
     
     # 5.3 Process Flow of the System
     add_numbered_subheading(doc, "Process Flow of the System", f"{counter}.3")
-    for line in process_flow_text.splitlines():
+    
+    # Parse process flow text and apply numbered + bold formatting
+    flow_lines = process_flow_text.splitlines()
+    flow_counter = 1
+    in_output_chutes = False
+    sub_counter = ord('a')  # for alphabetical sub-numbering
+    
+    for line in flow_lines:
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
         
-        # Parse and apply bold formatting for **text**
-        p = doc.add_paragraph()
-        parts = re.split(r'(\*\*[^\*]+\*\*)', line)
-        for part in parts:
-            if part.startswith('**') and part.endswith('**'):
-                # Bold text
-                text = part[2:-2]
-                run = p.add_run(text)
-                run.bold = True
-            else:
-                # Normal text
-                run = p.add_run(part)
+        # Skip lines that are just "Process Flow" or similar headers
+        if line.lower() in ['process flow', 'process']:
+            continue
+        
+        # Check if this is "Output Chutes" main heading
+        if line.lower().startswith('output chutes'):
+            in_output_chutes = True
+            sub_counter = ord('a')  # Reset alphabetical counter for sub-items
+            p = doc.add_paragraph()
+            run = p.add_run(f"{flow_counter}. ")
+            run.bold = True
             run.font.name = "Calibri"
             run.font.size = Pt(11)
+            
+            run = p.add_run("Output Chutes")
+            run.bold = True
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+            
+            flow_counter += 1
+            continue
+        
+        # Check if we're in Output Chutes section and this is a sub-component (line starts with a. b. c. etc)
+        if in_output_chutes and len(line) > 2 and line[0].isalpha() and line[1] == '.':
+            # This is already formatted as "a. Live Chutes - Description" - extract and reformat
+            clean_line = line[3:].strip() if len(line) > 3 else line
+            
+            # Split component title from description
+            # Can be separated by " - ", " – ", or just " "
+            separators = [" – ", " - ", ":"]
+            component_title = clean_line
+            description = ""
+            
+            for sep in separators:
+                if sep in clean_line:
+                    parts = clean_line.split(sep, 1)
+                    component_title = parts[0].strip()
+                    description = sep + parts[1] if len(parts) > 1 else ""
+                    break
+            
+            # If no separator found, check if first part is title (ends before " There are" or " A total")
+            if not description:
+                if " There are" in clean_line or " A total" in clean_line:
+                    match = re.search(r'^([^–\-:]+?)(?=\s+(?:There are|A total|One|[0-9]))', clean_line)
+                    if match:
+                        component_title = match.group(1).strip()
+                        description = " " + clean_line[len(component_title):].strip()
+            
+            p = doc.add_paragraph()
+            # Only bold the letter label and component title
+            run = p.add_run(f"{chr(sub_counter)}. ")
+            run.bold = True
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+            
+            run = p.add_run(component_title)
+            run.bold = True
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+            
+            # Description is NOT bold
+            if description:
+                run = p.add_run(description)
+                run.bold = False
+                run.font.name = "Calibri"
+                run.font.size = Pt(11)
+            
+            sub_counter += 1
+            continue
+        
+        # Main component line (contains colon - typical format: "Component Name: Description")
+        if ':' in line and not in_output_chutes:
+            # Extract component name and description
+            component_name = line.split(':')[0].strip()
+            rest_of_line = ':'.join(line.split(':')[1:]).strip()
+            
+            p = doc.add_paragraph()
+            run = p.add_run(f"{flow_counter}. ")
+            run.bold = True
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+            
+            run = p.add_run(component_name)
+            run.bold = True
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+            
+            if rest_of_line:
+                run = p.add_run(f": {rest_of_line}")
+                run.bold = False
+                run.font.name = "Calibri"
+                run.font.size = Pt(11)
+            
+            flow_counter += 1
+            continue
+        
+        # Fallback for any other lines (shouldn't normally reach here)
+        if not in_output_chutes:
+            p = doc.add_paragraph()
+            parts = re.split(r'(\*\*[^\*]+\*\*)', line)
+            for part in parts:
+                if part.startswith('**') and part.endswith('**'):
+                    text = part[2:-2]
+                    run = p.add_run(text)
+                    run.bold = True
+                else:
+                    run = p.add_run(part)
+                run.font.name = "Calibri"
+                run.font.size = Pt(11)
+    
     doc.add_paragraph("")
     
     # 5.4 Main Benefits
@@ -6509,21 +7365,567 @@ def build_proposed_system_description_section(doc, counter, client_name, project
     for b in benefits:
         p = doc.add_paragraph(b, style='List Bullet')
         apply_normal_style(p)
+    
+    # NOTE: System Description is now a separate top-level section (6. System Description)
+    # It is added via build_system_description_section() after this function
+
+
+def transform_system_description_numbering(text: str, section_counter: int) -> str:
+    """
+    Transform internal numbering in System Description to use proper section counter.
+    
+    Converts:
+    - "**1. Infeed System**" -> "**6.1. Infeed System**"
+    - "**1.1 Infeed Conveyors**" -> "**6.1.1. Infeed Conveyors**"
+    - "**1.1.1 Aligning Conveyor**" -> "**6.1.1.1. Aligning Conveyor**"
+    
+    Where 6 is the section_counter.
+    """
+    import re
+    
+    def replace_heading_number(match):
+        bold_start = match.group(1)  # **
+        number = match.group(2)      # e.g., "1.1.1" or "1"
+        title = match.group(3)       # e.g., "Infeed Conveyors"
+        bold_end = match.group(4)    # **
+        
+        # Transform the number: prepend section counter
+        # "1" -> "6.1"
+        # "1.1" -> "6.1.1"
+        # "1.1.1" -> "6.1.1.1"
+        new_number = f"{section_counter}.{number}"
+        
+        # Ensure proper trailing period
+        if not new_number.endswith('.'):
+            new_number += '.'
+        
+        return f"{bold_start}{new_number} {title}{bold_end}"
+    
+    # Pattern to match bold headings with numbers: **1. Title** or **1.1 Title** or **1.1.1 Title**
+    # Handles both with and without trailing period after number
+    heading_pattern = r'(\*\*)\s*(\d+(?:\.\d+)*\.?)\s+(.+?)\s*(\*\*)'
+    
+    transformed = re.sub(heading_pattern, replace_heading_number, text)
+    
+    return transformed
+
+
+def build_system_description_section(doc, counter, system_description_text, costing_file=None):
+    """
+    Build System Description as a separate top-level section.
+    
+    This section has hierarchical numbering:
+    - 6. System Description (heading added externally)
+    - 6.1. Infeed System
+    - 6.1.1. Infeed Conveyors
+    - 6.1.1.1. Aligning Conveyor
+    etc.
+    """
+    if not system_description_text:
+        return
+    
+    doc.add_page_break()
+    add_numbered_heading(doc, "System Description", counter=counter)
+    
+    # Transform the internal numbering to match section counter
+    transformed_text = transform_system_description_numbering(system_description_text, counter)
+    
+    lines = transformed_text.splitlines()
+    table_inserted = False
+
+    # Image replacements for specific sub-components (matching st_sys_desc FIXED_IMAGE_MAP)
+    base_dir = Path(__file__).parent
+    fixed_image_dir = base_dir / "FIXED_IMAGE"
+    
+    # Complete mapping matching st_sys_desc.py FIXED_IMAGE_MAP
+    placeholder_images = {
+        # Induct subcomponents
+        "weighing conveyor": fixed_image_dir / "weigh_conv.PNG",
+        "buffer conveyors": fixed_image_dir / "buffer_conv.PNG",
+        "buffer conveyor": fixed_image_dir / "buffer_conv.PNG",
+        "orientation / loading conveyor": fixed_image_dir / "oriant_conv.PNG",
+        "orientation conveyor": fixed_image_dir / "oriant_conv.PNG",
+        "orientation loading conveyor": fixed_image_dir / "oriant_conv.PNG",
+        "loading conveyor": fixed_image_dir / "oriant_conv.PNG",
+        "intelligent merge conveyor": fixed_image_dir / "merge_conv.PNG",
+        "merge conveyor": fixed_image_dir / "merge_conv.PNG",
+        "angle merge": fixed_image_dir / "merge_conv.PNG",
+        
+        # Main Loop / CBS
+        "main loop": fixed_image_dir / "CROS_BELT_SORTER.PNG",
+        "main linear cbs": fixed_image_dir / "CROS_BELT_SORTER.PNG",
+        "cross belt sorter": fixed_image_dir / "CROS_BELT_SORTER.PNG",
+        "cbs": fixed_image_dir / "CROS_BELT_SORTER.PNG",
+        
+        # Carrier/Drive system
+        "carrier wheel drive": fixed_image_dir / "CAREER_WHEEL.PNG",
+        "carrier": fixed_image_dir / "CBS_CAREER.PNG",
+        "friction wheel drive": fixed_image_dir / "FRINCTION_WHEEL_DRIVE.PNG",
+        "linear motor drive": fixed_image_dir / "LINEAR_MOTOR_DRIVE.PNG",
+        "servo roller": fixed_image_dir / "SERVO_ROLLER.PNG",
+        
+        # Infeed/Conveyors
+        "infeed conveyor": fixed_image_dir / "buffer_conv.PNG",
+        "infeed conveyors": fixed_image_dir / "buffer_conv.PNG",
+        "straight and inclined conveyor": fixed_image_dir / "buffer_conv.PNG",
+        "curve conveyor": fixed_image_dir / "buffer_conv.PNG",
+    }
+
+    def _insert_image_paragraph(paragraph, img_path: Path, width_in: float = 5.5):
+        """Replace paragraph text with the given image."""
+        paragraph.text = ""
+        run = paragraph.add_run()
+        run.add_picture(str(img_path), width=Inches(width_in))
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    def _try_match_fixed_image(heading_text: str) -> Optional[Path]:
+        """Tolerant matching for image placeholders - mirrors st_sys_desc._try_add_fixed_image logic."""
+        h = (heading_text or "").strip().lower()
+        
+        # Direct match first
+        if h in placeholder_images:
+            img = placeholder_images[h]
+            if img.exists():
+                return img
+        
+        # Tolerant matching for induct subcomponents
+        if "weigh" in h:
+            img = placeholder_images.get("weighing conveyor")
+            if img and img.exists():
+                return img
+        if "buffer" in h:
+            img = placeholder_images.get("buffer conveyor")
+            if img and img.exists():
+                return img
+        if "orientation" in h or "loading" in h or "oriant" in h:
+            img = placeholder_images.get("orientation conveyor")
+            if img and img.exists():
+                return img
+        if "merge" in h or "angle" in h:
+            img = placeholder_images.get("merge conveyor")
+            if img and img.exists():
+                return img
+        
+        # Main Loop / CBS matching
+        if "main loop" in h or "main linear" in h or "cross belt" in h or "cbs" in h:
+            img = placeholder_images.get("main loop")
+            if img and img.exists():
+                return img
+        
+        # Carrier/Drive matching
+        if "carrier" in h:
+            img = placeholder_images.get("carrier")
+            if img and img.exists():
+                return img
+        if "friction" in h and "drive" in h:
+            img = placeholder_images.get("friction wheel drive")
+            if img and img.exists():
+                return img
+        if "linear motor" in h:
+            img = placeholder_images.get("linear motor drive")
+            if img and img.exists():
+                return img
+        if "servo" in h:
+            img = placeholder_images.get("servo roller")
+            if img and img.exists():
+                return img
+        
+        # Infeed conveyor matching
+        if "infeed" in h or "straight" in h or "inclined" in h:
+            img = placeholder_images.get("infeed conveyor")
+            if img and img.exists():
+                return img
+        if "curve" in h:
+            img = placeholder_images.get("curve conveyor")
+            if img and img.exists():
+                return img
+        
+        return None
+    
+    # Regex patterns for formatting
+    import re as _re_fmt
+    bold_rx = _re_fmt.compile(r"\*\*(.+?)\*\*")
+    heading_rx = _re_fmt.compile(r"^\s*\*\*\s*(\d+(?:\.\d+)*\.?)\s*(.+?)\s*\*\*\s*$")
+    bullet_rx = _re_fmt.compile(r"^\s*[-*•]\s+(.+)$")
+    
+    def _add_formatted_paragraph(doc, text_line: str):
+        """Add a paragraph with proper bold/bullet formatting."""
+        stripped = text_line.strip()
+        
+        # Handle heading lines with **bold** markers
+        heading_match = heading_rx.match(stripped)
+        if heading_match:
+            number = heading_match.group(1).strip()
+            heading_text = heading_match.group(2).strip()
+            p = doc.add_paragraph()
+            run = p.add_run(f"{number} {heading_text}")
+            run.bold = True
+            run.font.size = Pt(12)
+            run.font.name = 'Calibri'
+            return
+        
+        # Handle bullet points
+        bullet_match = bullet_rx.match(stripped)
+        if bullet_match:
+            bullet_text = bullet_match.group(1).strip()
+            p = doc.add_paragraph(style='List Bullet')
+            if "**" in bullet_text:
+                parts = bold_rx.split(bullet_text)
+                for i, part in enumerate(parts):
+                    if not part:
+                        continue
+                    run = p.add_run(part)
+                    if i % 2 == 1:
+                        run.bold = True
+            else:
+                p.add_run(bullet_text)
+            apply_normal_style(p)
+            return
+        
+        # Handle regular text with possible **bold** markers
+        if "**" in stripped:
+            p = doc.add_paragraph()
+            parts = bold_rx.split(stripped)
+            for i, part in enumerate(parts):
+                if not part:
+                    continue
+                run = p.add_run(part)
+                if i % 2 == 1:
+                    run.bold = True
+            apply_normal_style(p)
+        else:
+            p = doc.add_paragraph(text_line)
+            apply_normal_style(p)
+    
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        
+        # Skip empty lines
+        if not line_stripped:
+            doc.add_paragraph("")
+            continue
+        
+        # **KEY FIX: Check if this line contains the Conveyor BOQ table marker**
+        if '[[CONVEYOR_BOQ_TABLE]]' in line:
+            if costing_file:
+                table_data = extract_conveyor_boq_from_excel(costing_file)
+                if table_data and len(table_data) >= 2:
+                    rows = len(table_data)
+                    cols = len(table_data[0])
+                    table = doc.add_table(rows=rows, cols=cols)
+                    apply_table_style(table)
+
+                    for r_idx, row_data in enumerate(table_data):
+                        row_cells = table.rows[r_idx].cells
+                        for c_idx, cell_value in enumerate(row_data):
+                            row_cells[c_idx].text = str(cell_value)
+
+                            for paragraph in row_cells[c_idx].paragraphs:
+                                if r_idx == 0:
+                                    for run in paragraph.runs:
+                                        run.font.bold = True
+                                        run.font.name = 'Calibri'
+                                        run.font.size = Pt(11)
+                                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                    row_cells[c_idx].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                                else:
+                                    apply_normal_style(paragraph)
+
+                    table.columns[0].width = Inches(0.5)
+                    table.columns[1].width = Inches(2.0)
+                    table.columns[2].width = Inches(0.7)
+                    table.columns[3].width = Inches(0.7)
+                    table.columns[4].width = Inches(1.2)
+                    table.columns[5].width = Inches(1.2)
+                    table.columns[6].width = Inches(0.5)
+
+                    doc.add_paragraph("")
+                    st.success("✅ Conveyor BOQ table inserted successfully")
+                    table_inserted = True
+            # Skip writing the marker line itself
+            continue
+
+        # Handle specific image placeholders for sub-components
+        if "image placeholder" in line_stripped.lower():
+            # Extract the heading from [IMAGE PLACEHOLDER: <heading>]
+            import re as _re
+            ph_rx = _re.compile(r"^\s*\[IMAGE PLACEHOLDER:\s*(.+?)\s*\]\s*$", flags=_re.IGNORECASE)
+            m = ph_rx.match(line_stripped)
+            if m:
+                heading = m.group(1).strip()
+                matched_path = _try_match_fixed_image(heading)
+            else:
+                # Fallback: use entire line for matching
+                matched_path = _try_match_fixed_image(line_stripped)
+
+            if matched_path and matched_path.exists():
+                try:
+                    p = doc.add_paragraph()
+                    _insert_image_paragraph(p, matched_path)
+                    doc.add_paragraph("")
+                except Exception as e:
+                    st.warning(f"Image insert failed for {matched_path.name}: {e}")
+                    # Don't add the placeholder text if image insertion failed
+            else:
+                # No matching image found - skip the placeholder line (don't show it in final doc)
+                pass
+            continue
+        
+        # Regular text line - insert as formatted paragraph
+        _add_formatted_paragraph(doc, line)
+
+    # Fallback: if marker was missing but we have a costing file, try heading-based insertion
+    if not table_inserted and costing_file:
+        insert_conveyor_boq_table(doc, costing_file)
+
+    # Final pass: replace any remaining image placeholders that may exist
+    for para in doc.paragraphs:
+        text_lower = para.text.lower()
+        if "image placeholder" in text_lower:
+            # Use tolerant matching function
+            matched_path = _try_match_fixed_image(para.text)
+            if matched_path and matched_path.exists():
+                try:
+                    _insert_image_paragraph(para, matched_path)
+                except Exception as e:
+                    st.warning(f"Image insert failed for {matched_path.name}: {e}")
+            else:
+                # Remove unmatched placeholder text from final document
+                para.text = ""
+
+
+def extract_conveyor_boq_from_excel(costing_file) -> List[List[str]]:
+    """Extract Conveyor BOQ table from Conveyors sheet - 7 columns"""
+    try:
+        # Read the Conveyors sheet
+        df = pd.read_excel(costing_file, sheet_name="Conveyors", header=None)
+        
+        # Find the header row (contains "S No.", "Name", etc.)
+        header_row_idx = None
+        for idx in range(min(10, len(df))):  # Search first 10 rows
+            row_values = df.iloc[idx].values
+            row_str = ' '.join([str(v).lower() for v in row_values if pd.notna(v)])
+            if 's no' in row_str and 'name' in row_str and 'conveyor length' in row_str:
+                header_row_idx = idx
+                break
+        
+        if header_row_idx is None:
+            st.warning("Could not find header row in Conveyors sheet")
+            return []
+        
+        # Re-read with correct header
+        df = pd.read_excel(costing_file, sheet_name="Conveyors", header=header_row_idx)
+        
+        # Expected columns (in order)
+        required_cols = ['S No.', 'Name', 'EL_1', 'EL_2', 'Conveyor Length (m)', 'Conveyor width (mm)', 'Set']
+        
+        # Find actual column names (flexible matching)
+        col_mapping = {}
+        for req_col in required_cols:
+            req_normalized = req_col.lower().replace(' ', '').replace('_', '').replace('.', '').replace('(', '').replace(')', '')
+            
+            for actual_col in df.columns:
+                actual_normalized = str(actual_col).lower().replace(' ', '').replace('_', '').replace('.', '').replace('(', '').replace(')', '')
+                
+                # Match by normalized comparison
+                if req_normalized in actual_normalized or actual_normalized in req_normalized:
+                    col_mapping[req_col] = actual_col
+                    break
+        
+        if len(col_mapping) < 6:  # At least 6 out of 7 columns needed
+            st.warning(f"Could not find all required columns. Found: {list(col_mapping.keys())}")
+            return []
+        
+        # Extract data with actual column names
+        actual_cols = [col_mapping.get(req_col) for req_col in required_cols if req_col in col_mapping]
+        selected_df = df[actual_cols].copy()
+        
+        # Rename to standard names
+        rename_dict = {col_mapping[req_col]: req_col for req_col in required_cols if req_col in col_mapping}
+        selected_df = selected_df.rename(columns=rename_dict)
+        
+        # Remove rows where S No. is empty or NaN
+        if 'S No.' in selected_df.columns:
+            selected_df = selected_df[selected_df['S No.'].notna()]
+            # Also remove rows where S No. is empty string
+            selected_df = selected_df[selected_df['S No.'].astype(str).str.strip() != '']
+        
+        # Convert to list of lists (header + data rows)
+        table_data = [required_cols]  # Header row
+        
+        for _, row in selected_df.iterrows():
+            row_data = []
+            for col in required_cols:
+                if col in row.index:
+                    val = row[col]
+                    # Format numbers appropriately
+                    if pd.notna(val):
+                        if isinstance(val, (int, float)):
+                            # Keep numbers as they are, but remove unnecessary decimals
+                            if isinstance(val, float) and val.is_integer():
+                                row_data.append(str(int(val)))
+                            else:
+                                row_data.append(str(val))
+                        else:
+                            row_data.append(str(val))
+                    else:
+                        row_data.append('')
+                else:
+                    row_data.append('')
+            
+            table_data.append(row_data)
+        
+        return table_data
+        
+    except Exception as e:
+        st.warning(f"Could not extract Conveyor BOQ: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        return []
+
+
+def insert_conveyor_boq_table_after_heading(doc: Document, costing_file, heading_para):
+    """Insert Conveyor BOQ table immediately after a specific heading paragraph"""
+    try:
+        # Extract table data
+        table_data = extract_conveyor_boq_from_excel(costing_file)
+        
+        if not table_data or len(table_data) < 2:
+            st.warning("No Conveyor BOQ data found to insert")
+            return
+        
+        # Create table
+        rows = len(table_data)
+        cols = len(table_data[0])
+        table = doc.add_table(rows=rows, cols=cols)
+        apply_table_style(table)
+        
+        # Fill table with data
+        for r_idx, row_data in enumerate(table_data):
+            row_cells = table.rows[r_idx].cells
+            for c_idx, cell_value in enumerate(row_data):
+                row_cells[c_idx].text = str(cell_value)
+                
+                # Format cells
+                for paragraph in row_cells[c_idx].paragraphs:
+                    if r_idx == 0:  # Header row
+                        for run in paragraph.runs:
+                            run.font.bold = True
+                            run.font.name = 'Calibri'
+                            run.font.size = Pt(11)
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        row_cells[c_idx].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                    else:  # Data rows
+                        apply_normal_style(paragraph)
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        
+        # Set column widths (adjust as needed)
+        table.columns[0].width = Inches(0.5)   # S No.
+        table.columns[1].width = Inches(2.0)   # Name
+        table.columns[2].width = Inches(0.7)   # EL_1
+        table.columns[3].width = Inches(0.7)   # EL_2
+        table.columns[4].width = Inches(1.2)   # Conveyor Length
+        table.columns[5].width = Inches(1.2)   # Conveyor width
+        table.columns[6].width = Inches(0.5)   # Set
+        
+        # Insert table after the heading using XML manipulation
+        table_element = table._element
+        heading_element = heading_para._element
+        heading_element.addnext(table_element)
+        
+        # Add a blank paragraph after table for spacing
+        blank_para_element = heading_element.makeelement(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p',
+            nsmap=heading_element.nsmap
+        )
+        table_element.addnext(blank_para_element)
+        
+        st.success("✅ Conveyor BOQ table inserted successfully after heading")
+        
+    except Exception as e:
+        st.warning(f"Could not insert Conveyor BOQ table: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+
+def insert_conveyor_boq_table(doc: Document, costing_file):
+    """Find 'Conveyor BOQ' heading in doc and insert table after it (fallback method)"""
+    try:
+        # Extract table data
+        table_data = extract_conveyor_boq_from_excel(costing_file)
+        
+        if not table_data or len(table_data) < 2:
+            st.warning("No Conveyor BOQ data found")
+            return
+        
+        # Find the paragraph containing "Conveyor BOQ" (case-insensitive)
+        target_para = None
+        for para in doc.paragraphs:
+            if 'conveyor boq' in para.text.lower() and len(para.text.strip()) < 50:
+                target_para = para
+                break
+        
+        if target_para is None:
+            st.warning("Could not find 'Conveyor BOQ' heading in document")
+            return
+        
+        # Create table
+        rows = len(table_data)
+        cols = len(table_data[0])
+        table = doc.add_table(rows=rows, cols=cols)
+        apply_table_style(table)
+        
+        # Fill table
+        for r_idx, row_data in enumerate(table_data):
+            row_cells = table.rows[r_idx].cells
+            for c_idx, cell_value in enumerate(row_data):
+                row_cells[c_idx].text = str(cell_value)
+                
+                # Format cells
+                for paragraph in row_cells[c_idx].paragraphs:
+                    if r_idx == 0:  # Header row
+                        for run in paragraph.runs:
+                            run.font.bold = True
+                            run.font.name = 'Calibri'
+                            run.font.size = Pt(11)
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    else:
+                        apply_normal_style(paragraph)
+        
+        # Set column widths
+        table.columns[0].width = Inches(0.5)
+        table.columns[1].width = Inches(2.0)
+        table.columns[2].width = Inches(0.7)
+        table.columns[3].width = Inches(0.7)
+        table.columns[4].width = Inches(1.2)
+        table.columns[5].width = Inches(1.2)
+        table.columns[6].width = Inches(0.5)
+        
+        # Move table to correct position
+        table_element = table._element
+        target_element = target_para._element
+        target_element.addnext(table_element)
+        
+        st.success("✅ Conveyor BOQ table inserted successfully")
+        
+    except Exception as e:
+        st.warning(f"Could not insert Conveyor BOQ table: {e}")
 
 def generate_system_description_from_sd_sys(dxf_path: Path, costing_file_upload, project_name: str,
                                            client_name: str = "", pph_count: str = "", ipp_rate: str = "") -> tuple[str, dict, dict, dict]:
-    """Generate System Description using `sys_desc_latest` utilities.
+    """Generate System Description using `st_sys_desc` utilities.
 
     Returns: (system_description_text, detected_json, tables_dict, cost_vals_dict)
     """
-    # Build DXF JSON using existing extractor in the main app
+    # Build DXF JSON using st_sys_desc extractor (compute_dxf_metrics expects this format)
     full = {}
     try:
-        full = extract_dxf_components(dxf_path, project_name)
-    except Exception:
-        # fallback: try sys_desc_latest if it offers a full extractor
+        full = sd_sys.extract_dxf_full_json(dxf_path)
+    except Exception as e:
+        logger.warning(f"sd_sys.extract_dxf_full_json failed: {e}; trying fallback")
+        # fallback: try main app's extractor (may produce incompatible format)
         try:
-            full = sd_sys.extract_full_dxf_info(dxf_path)
+            full = extract_dxf_components(dxf_path, project_name)
         except Exception:
             full = {}
 
@@ -6562,18 +7964,13 @@ def generate_system_description_from_sd_sys(dxf_path: Path, costing_file_upload,
             tables = {}
             cost_vals = {}
 
-    # Prepare variables map
-    variables = {}
-    variables["UNIT"] = metrics.get("UNITS", "")
-    variables["Type of CBS"] = metrics.get("TYPE OF CBS", "")
-    variables["COUNT"] = str(metrics.get("TOTAL CONVEYOR / SUBCOMPONENT COUNT", ""))
-    variables["Feedline count"] = str(metrics.get("FEEDLINE COUNT", ""))
-    variables["DEGREE OF ANGLE MERGE"] = metrics.get("DEGREE OF ANGLE MERGE", "")
-    variables["COUNT OF REJECTION CHUTE"] = str(metrics.get("COUNT OF REJECTION CHUTE", ""))
-    variables["COUNT OF DISPERSION CHUTE"] = str(metrics.get("COUNT OF DISPERSION CHUTE", ""))
-    variables["COUNT OF COLLECTION CHUTE"] = str(metrics.get("COUNT OF COLLECTION CHUTE", ""))
-    variables["CBS HEIGHT FROM GROUND"] = cost_vals.get("CBS HEIGHT FROM GROUND", "")
-    variables["PITCH LENGTH"] = cost_vals.get("PITCH LENGTH", "")
+    # Filter Conveyor BOQ to ONLY requested columns (matching st_sys_desc behavior)
+    if "Conveyor BOQ" in tables and tables["Conveyor BOQ"]:
+        tables["Conveyor BOQ"] = sd_sys.filter_conveyor_boq_columns(tables["Conveyor BOQ"])
+
+    # Build variables map using st_sys_desc function
+    variables = sd_sys.build_variables_map(metrics, cost_vals)
+    # Add additional client-specific variables
     variables["CLIENT'S NAME"] = (client_name or "").strip()
     variables["CLIENT NAME"] = variables["CLIENT'S NAME"]
     variables["PPH COUNT"] = (pph_count or "").strip()
@@ -6586,7 +7983,13 @@ def generate_system_description_from_sd_sys(dxf_path: Path, costing_file_upload,
     detected_fallback = sd_sys.build_detected_json(metrics)
     detected = sd_sys.normalize_detected(det_raw, detected_fallback)
 
-    # Enforce mandatory mappings
+    # Enforce: infeed subcomponents (ONLY if found in DXF)
+    detected = sd_sys.enforce_infeed_subcomponents_from_dxf(detected, metrics, full)
+
+    # Enforce: induct subcomponents (ONLY if found in DXF) + correct names + buffer classification
+    detected = sd_sys.enforce_induct_subcomponents_from_dxf(detected, metrics, full)
+
+    # Enforce mandatory mappings (additional fallbacks)
     if metrics.get("FS002 WITHOUT WEIGHING COUNT", 0) > 0:
         detected.setdefault("Parcel Inducts / Induction to Sorter", {})
         detected["Parcel Inducts / Induction to Sorter"].setdefault("Feedlines", {"Feedline Count": int(metrics.get("FEEDLINE COUNT", 1)), "Subcomponents": {}})
@@ -6696,23 +8099,13 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                         # Generate Process Flow if Proposed System is included
                         if include_proposed_system:
                             # If a preview was already generated earlier in the session, reuse it
-                            if st.session_state.get('preview_process_flow'):
-                                process_flow_text = st.session_state.get('preview_process_flow')
-                                iteration_details = st.session_state.get('iteration_details')
-                                st.info("Using previously generated Process Flow from preview")
-                            else:
-                                st.info("✍️ Generating Process Flow with AI...")
-                                process_flow_text, iteration_details = call_groq_for_process_flow(
-                                    client_name, project_name, dxf_json
-                                )
-                                # Cache preview in session_state for potential reuse
-                                try:
-                                    st.session_state['preview_process_flow'] = process_flow_text
-                                    st.session_state['iteration_details'] = iteration_details
-                                except Exception:
-                                    pass
-                                st.success("✅ Process Flow generated")
-                                time.sleep(2)  # Delay to avoid rate limits
+                            # Always generate fresh process flow using agentY agentic solution
+                            st.info("✍️ Generating Process Flow with AI (Agentic Solution)...")
+                            process_flow_text, iteration_details = call_groq_for_process_flow(
+                                client_name, project_name, dxf_json
+                            )
+                            st.success("✅ Process Flow generated")
+                            time.sleep(2)  # Delay to avoid rate limits
                     except Exception as e:
                         st.warning(f"Could not process DXF for initial flow: {str(e)}")
                         dxf_json = None
@@ -6776,6 +8169,9 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             if (include_proposed_system or include_concept_desc) and dxf_layout_file and process_flow_text:
                 with st.spinner("🔧 Continuing AI content generation..."):
                     try:
+                        # Initialize variables for extracted data
+                        tables = {}
+                        
                         # Reuse temp directory from DXF processing
                         if 'tmp_dir' not in locals():
                             tmp_dir = Path(tempfile.mkdtemp(prefix="proposal_"))
@@ -6788,7 +8184,7 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                         if include_proposed_system and process_flow_text and dxf_json:
                             st.info("📋 Generating comprehensive System Description with AI...")
                             try:
-                                # Use sys_desc_latest pipeline to produce final system description text
+                                # Use st_sys_desc pipeline to produce final system description text
                                 sys_desc_final, detected, sd_tables, sd_cost_vals = generate_system_description_from_sd_sys(
                                     dxf_path=dxf_path,
                                     costing_file_upload=costing_file if 'costing_file' in locals() else None,
@@ -6799,11 +8195,8 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                                 )
                                 system_description_text = sys_desc_final
                                 # merge any extracted tables/cost_vals for potential later use
-                                try:
-                                    if sd_tables:
-                                        tables.update(sd_tables)
-                                except Exception:
-                                    pass
+                                if sd_tables:
+                                    tables.update(sd_tables)
                                 st.success("✅ System Description generated")
                             except Exception as e:
                                 st.warning(f"System Description generation failed: {e}")
@@ -6812,10 +8205,18 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                         # Generate Executive Summary from process flow if included
                         if include_exec_summary and process_flow_text:
                             st.info("📝 Generating Executive Summary with AI...")
-                            exec_summary_text = call_groq_exec_summary(process_flow_text, client_name, project_name)
+                            cbs_type_detected = dxf_json.get('cbs_type', 'Cross-belt technology') if dxf_json else 'Cross-belt technology'
+                            exec_summary_text = call_groq_exec_summary(
+                                process_flow_text, 
+                                client_name, 
+                                project_name,
+                                pph_count=pph_count, 
+                                cbs_type=cbs_type_detected,
+                                dxf_json=dxf_json
+                            )
                             st.success("✅ Executive Summary generated")
                             time.sleep(2)  # Delay to avoid rate limits
-                        
+                                                
                         # Generate Mermaid Flowchart if Concept Description is included
                         if include_concept_desc and process_flow_text:
                             st.info("🗺️ Generating Mermaid flowchart...")
@@ -6893,6 +8294,9 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             # Always start with a fresh document that has all standard Word styles
             doc = Document()
             
+            # Initialize tables dictionary for costing tables (Conveyor BOQ, etc.)
+            tables = {}
+            
             # Ensure required list styles exist
             ensure_list_styles(doc)
             
@@ -6928,32 +8332,40 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                 build_company_profile_section(doc, counter)
                 counter += 1
 
-            # 3. Handled Shipment Spectrum
+            # 3. Reference Projects
+            if include_reference_projects:
+                build_reference_projects_section(doc, counter)
+                counter += 1
+
+            # 4. Handled Shipment Spectrum
             if include_handled_spectrum:
                 build_handled_spectrum_section(doc, counter, project_name, client_name)
                 counter += 1
 
-            # 4. Proposed System Description
+            # 5. Proposed System Description
             if include_proposed_system and process_flow_text:
                 build_proposed_system_description_section(doc, counter, client_name, project_name, 
-                                                         process_flow_text, layout_png_path)
+                                                         process_flow_text, layout_png_path, 
+                                                         system_description_text=None,  # System Description is now separate
+                                                         costing_file=None)  # Costing file used in System Description section
                 counter += 1
             
-            # 4.1 System Description (Detailed)
+            # 6. Concept Description (moved after Proposed System Description, before Sorter System Capacity)
+            if include_concept_desc and flowchart_png_bytes:
+                build_concept_description_section(doc, counter, flowchart_png_bytes)
+                counter += 1
+            
+            # 7. Sorter System Capacity (moved before System Description)
+            if include_capacity_section and capacity_excel is not None:
+                build_capacity_calculations_section(doc, counter, client_name, project_name, capacity_excel)
+                counter += 1
+            
+            # 8. System Description (Separate top-level section with hierarchical numbering)
             if include_proposed_system and system_description_text:
-                doc.add_page_break()
-                add_numbered_heading(doc, "System Description", counter=counter)
-                # Insert the LLM-produced system description text preserving markers
-                for line in (system_description_text or "").splitlines():
-                    # Preserve blank lines
-                    if not line.strip():
-                        doc.add_paragraph("")
-                        continue
-                    p = doc.add_paragraph(line)
-                    apply_normal_style(p)
+                build_system_description_section(doc, counter, system_description_text, costing_file=costing_file)
                 counter += 1
             
-            # 4.2 Description of Components (from Loop CBS Excel if available)
+            # 9. Description of Components (from Loop CBS Excel if available)
             sorter_spec = None
             if costing_file is not None:
                 try:
@@ -6969,9 +8381,20 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
             build_description_of_components_section(doc, counter, sorter_spec)
             counter += 1
             
-            # 5. Proposed System Technical Details (from Quote Master Excel if available)
+            # 10. Proposed System Technical Details (Mechanical from Groq, Electrical/Control from Groq)
+            mechanical_bom_items = None
             bom_json = None
+            
             if costing_file is not None:
+                # Generate Mechanical equipment BOM using Groq API (extracts from all relevant sheets)
+                try:
+                    mechanical_bom_items = generate_mechanical_bom_from_costing(costing_file)
+                    if mechanical_bom_items and len(mechanical_bom_items) > 0:
+                        st.success("✓ Generated Mechanical equipment BOM from costing file")
+                except Exception as e:
+                    st.warning(f"Could not generate Mechanical BOM: {e}")
+                
+                # Generate Electrical Equipment and Control System using Groq API
                 try:
                     # Load Quote Master sheet from costing file
                     with pd.ExcelFile(io.BytesIO(costing_file.getvalue())) as xls:
@@ -6986,84 +8409,80 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                             sheet_text = df_to_compact_text_quote_master(df_quote)
                             bom_json = call_groq_for_bom(sheet_text)
                             if bom_json:
-                                st.success("✓ Generated Proposed System Technical Details from Quote Master")
+                                st.success("✓ Generated Electrical/Control System details from Quote Master")
                         else:
-                            st.info("ℹ️ Quote Master sheet not found in costing file - skipping technical details section")
+                            st.info("ℹ️ Quote Master sheet not found in costing file - skipping Electrical/Control details")
                 except Exception as e:
                     st.warning(f"Could not extract Quote Master data: {e}")
             
-            if bom_json:
-                build_proposed_system_technical_details_section(doc, counter, bom_json)
+            # Build section if we have either mechanical BOM or electrical/control from Groq
+            has_mechanical = mechanical_bom_items is not None and len(mechanical_bom_items) > 0
+            has_electrical_control = bom_json is not None
+            
+            if has_mechanical or has_electrical_control:
+                build_proposed_system_technical_details_section(doc, counter, 
+                                                                mechanical_bom_items=mechanical_bom_items, 
+                                                                bom_json=bom_json)
                 counter += 1
             
-            # 6. Concept Description
-            if include_concept_desc and flowchart_png_bytes:
-                build_concept_description_section(doc, counter, flowchart_png_bytes)
-                counter += 1
-
-            # 7. Capacity Calculations Section (optional)
-            if include_capacity_section and capacity_excel is not None:
-                build_capacity_calculations_section(doc, counter, client_name, project_name, capacity_excel)
-                counter += 1
-
-            # 8. Electrical System
+            # 11. Electrical System
             if elec_include:
                 build_electrical_section(doc, counter)
                 counter += 1
             
-            # 9. Falcon WCS CONTROLIT
+            # 12. Falcon WCS CONTROLIT
             if wcs_include:
                 build_wcs_section(doc, counter, client_name)
                 counter += 1
             
-            # 10. Falcon Visual Inspection System (SCADA)
+            # 13. Falcon Visual Inspection System (SCADA)
             if scada_include:
                 build_scada_section(doc, counter, client_name)
                 counter += 1
             
-            # 11. Key Components Make
+            # 14. Key Components Make
             if key_include:
                 build_key_components_section(doc, counter, key_components_edited)
                 counter += 1
             
-            # 12. Principal of Safety
+            # 15. Principal of Safety
             if safety_include:
                 build_safety_section(doc, counter)
                 counter += 1
             
-            # 13. Infrastructure
+            # 16. Infrastructure
             if infra_include:
                 build_infrastructure_section(doc, counter)
                 counter += 1
             
-            # 14. Program Organisation
+            # 17. Program Organisation
             if prog_include:
                 build_program_org_section(doc, counter, client_name, prog_gantt)
                 counter += 1
             
-            # 15. Client Responsibility
+            # 18. Client Responsibility
             if client_resp_include:
                 build_client_responsibility_section(doc, counter, client_name)
                 counter += 1
             
-            # 16. System Handover
+            # 19. System Handover
             if handover_include:
                 build_handover_section(doc, counter)
                 counter += 1
             
-            # 17. Commercial
+            # 20. Commercial
             if commercial_include:
                 build_commercial_section(doc, counter, price_data, payment_terms_data, bca_discount)
                 counter += 1
             
-            # 18. Warranty Period
+            # 21. Warranty Period
             if warranty_include:
                 build_warranty_section(doc, counter, warranty_type, warranty_duration, 
                                       warranty_start, warranty_extended_text, 
                                       warranty_amc_text, warranty_transport_text)
                 counter += 1
             
-            # 19. Exclusions
+            # 22. Exclusions
             if exclusion_include:
                 build_exclusions_section(doc, counter, selected_exclusions)
                 counter += 1
@@ -7249,3 +8668,5 @@ if st.button("Generate Final DOCX Document", type="primary", width='stretch'):
                     os.remove(client_logo_path)
             except:
                 pass
+
+

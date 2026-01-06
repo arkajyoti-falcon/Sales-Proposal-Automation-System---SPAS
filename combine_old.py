@@ -33,7 +33,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # CBS Domain Knowledge Document Path
-CBS_KNOWLEDGE_DOC = Path(__file__).parent.parent / "Generalized Falcon CBS Ecosystem.docx"
+# Try multiple locations for the CBS knowledge document
+CBS_KNOWLEDGE_DOC_PATHS = [
+    Path(__file__).parent / "Generalized Falcon CBS Ecosystem.docx",  # Same folder as script
+    Path(__file__).parent.parent / "Generalized Falcon CBS Ecosystem.docx",  # Parent folder
+    Path("D:/Projects/1. Propsal_Automation/Generalized Falcon CBS Ecosystem.docx"),  # Absolute path
+]
+
+def _find_cbs_knowledge_doc() -> Path:
+    """Find the CBS knowledge document from multiple possible locations."""
+    for path in CBS_KNOWLEDGE_DOC_PATHS:
+        if path.exists():
+            return path
+    return CBS_KNOWLEDGE_DOC_PATHS[0]  # Return first path for error message
+
+CBS_KNOWLEDGE_DOC = _find_cbs_knowledge_doc()
 
 
 def load_cbs_domain_knowledge() -> str:

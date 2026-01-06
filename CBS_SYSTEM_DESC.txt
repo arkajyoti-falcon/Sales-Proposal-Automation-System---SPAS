@@ -114,20 +114,14 @@ flows from the connected inductions, is always less than the planned induction c
 Totes & Boxes. 
 
 # Feedlines - 
-1.[Type of CBS] CBS has [Feedline count] fully Automatic Feedlines with Designed IPP of [IPP Rate] PPH. 
-Each Feedline has [total count of sub component / conveyor] Conveyor Modules-  
-[List sub components in Feedlines like below]
- Buffer Conveyor- [count]
- Weighing Conveyor- [count]
- Receiving Conveyor- [count]
- Spacing Conveyor- [count]
- Short Buffer conveyor- [count]
- Angle Merge- [count]
-2. Sensors are placed on the Induct Lines to determine the exact position and dimensions 
-(Length and Width) of the Shipment on the conveyor and prepare the Cross-Belt Cell for 
-receiving the shipment with high precision.  
-3. Over the feedline, shipments are evenly spaced and smoothly transferred to the main Linear 
-CBS.
+1. [Type of CBS] CBS has a total [Feedlines Count] Feedlines with [Conveyor Module Count] conveyor modules. Each Feedline has the following Conveyor Modules:
+   • Loading Conveyor- [Loading Conveyor Count] No. 
+   • Buffer Conveyor- [Buffer Conveyor Count] No. 
+   • Intelligent Merge- [Intelligent Merge Count] No.
+
+2. Sensors are placed on the Induct Lines to determine the exact position and dimensions (Length and Width) of the Shipment on the conveyor and prepare the Cross-Belt Cell for receiving the shipment with high precision.
+
+3. Over the feedline, shipments are evenly spaced and smoothly transferred to the main [Type of CBS] CBS.
 
 # Buffer Conveyor- 
 A buffer conveyor, also known as a buffering conveyor or accumulation conveyor, is a type of conveyor 
@@ -190,22 +184,20 @@ induct will scan the barcode of the bag received from the bagging conveyor.
 # Main Loop - 
 ! Incase of Loop CBS 
 
-1. The proposed Loop CBS Sorter will be installed on Ground level. The Sorter runs at [CBS HEIGHT FROM GROUND]mm 
-from Ground level.  
-2. We have provided loop with Belt Carriers with [PITCH LENGTH] mm pitch and Belt Size of 
+•	The Loop CBS sorter is installed at ground level with a sorter height ranging from 2.4 m to 3.5 m.
+•	We have provided loop with Belt Carriers with [PITCH LENGTH] mm pitch and Belt Size of 
 495 x 800mm.                           
-3. As Shipments pass through the Barcode Scanning Tunnel on the Loop, their barcodes are 
+•	As Shipments pass through the Barcode Scanning Tunnel on the Loop, their barcodes are 
 scanned, and chutes are assigned. Once the shipment reaches the respective chute, the carrier 
 carrying the shipment for the chute will actuate and drop the shipment in the assigned chute. 
 
 ! Incase of Linear CBS 
-1. The proposed Linear CBS Sorter will be installed on ground level. The Sorter runs at [CBS HEIGHT FROM GROUND] mm 
-from ground level. 
-2. We have provided Linear with belt Carriers with [PITCH LENGTH] pitch and Belt Size of 495 x 
+•	The Linear CBS sorter is installed at ground level with a sorter height ranging from 2.4 m to 3.5 m.
+•	We have provided Linear with belt Carriers with [PITCH LENGTH] pitch and Belt Size of 495 x 
 800mm. 
-3. One Linear CBS has a top running length of 81 m & a total length of 164.5 m & 333 number of 
+•	One Linear CBS has a top running length of 81 m & a total length of 164.5 m & 333 number of 
 carriers. 
-4. As Parcel pass through the Barcode Scanning Tunnel on the Linear CBS, their barcodes are 
+•	As Parcel pass through the Barcode Scanning Tunnel on the Linear CBS, their barcodes are 
 scanned, and chutes are assigned. Once the Parcel reaches the respective chute, the carrier 
 carrying the Parcel for the chute will actuate and drop the Parcel in the assigned chute. 
 

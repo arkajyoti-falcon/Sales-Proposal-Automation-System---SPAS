@@ -32,47 +32,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# CBS Domain Knowledge Document Path
-CBS_KNOWLEDGE_DOC = Path(__file__).parent.parent / "Generalized Falcon CBS Ecosystem.docx"
-
-
-def load_cbs_domain_knowledge() -> str:
-    """
-    Load the generalized CBS ecosystem knowledge from docx file.
-    This provides domain expertise for better process flow generation.
-    """
-    if not CBS_KNOWLEDGE_DOC.exists():
-        logger.warning(f"CBS knowledge document not found: {CBS_KNOWLEDGE_DOC}")
-        return ""
-    
-    try:
-        doc = Document(str(CBS_KNOWLEDGE_DOC))
-        content = []
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if text:
-                content.append(text)
-        
-        # Also extract from tables if any
-        for table in doc.tables:
-            for row in table.rows:
-                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-                if row_text:
-                    content.append(row_text)
-        
-        knowledge = "\n".join(content)
-        logger.info(f"Loaded CBS domain knowledge: {len(knowledge)} characters")
-        return knowledge
-    except Exception as e:
-        logger.error(f"Error loading CBS knowledge document: {e}")
-        return ""
-
-
-# Load CBS domain knowledge at startup (cached)
-@st.cache_data
-def get_cbs_knowledge() -> str:
-    """Cached loader for CBS domain knowledge."""
-    return load_cbs_domain_knowledge()
 
 # CONFIG
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -456,8 +415,6 @@ def generate_initial_flow(client_name: str, dxf_json: dict,
     dxf_summary = create_dxf_summary(dxf_json)
     use_numbering = detect_numbering_style(reference_flows)
     
-    # Load CBS domain knowledge for better understanding
-    cbs_knowledge = get_cbs_knowledge()
     
     # Build reference context
     ref_context = ""
@@ -467,16 +424,7 @@ def generate_initial_flow(client_name: str, dxf_json: dict,
             ref_context += f"\nExample {i} ({ref['client']}):\n"
             ref_context += ref["process_flow"][:5000] + "...\n"
     
-    # Build domain knowledge context
-    domain_context = ""
-    if cbs_knowledge:
-        domain_context = f"""
-=== CBS DOMAIN KNOWLEDGE (Falcon CBS Ecosystem) ===
-Use this knowledge to understand how CBS systems work and write accurate process flows:
 
-{cbs_knowledge}
-
-=== END DOMAIN KNOWLEDGE ==="""
     
     system_prompt = """## ROLE
 You are a senior solution engineer writing the "Process Flow of the System" section for Cross-Belt Sorter (CBS) proposals. Your output must **exactly match** the style, structure, and content depth of professional CBS proposals while strictly adhering to provided data.

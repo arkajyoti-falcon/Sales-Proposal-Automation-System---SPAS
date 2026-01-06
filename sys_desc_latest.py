@@ -12,7 +12,6 @@ from collections import Counter
 from typing import Dict, Any, List, Tuple, Optional
 
 import requests
-import streamlit as st
 import ezdxf
 from openpyxl import load_workbook
 from docx import Document
@@ -69,151 +68,8 @@ def load_template_text() -> str:
 # -----------------------------
 def _collect_from_space(space, top_inserts: Counter, layers: Counter, text_snips: Counter, entity_types: Counter):
     for e in space:
-        if __name__ == "__main__":
-            # -----------------------------
-            # STREAMLIT APP
-            st.set_page_config(page_title="DXF + Costing -> System Description (DOCX)", layout="wide")
-
-            if not GROQ_API_KEY:
-                st.error("Set GROQ_API_KEY in environment.")
-                st.stop()
-
-            template_text = load_template_text()
-            if not template_text.strip():
-                st.error("CBS_SYSTEM_DESC.txt not found or empty. Put it next to this script or set CBS_TEMPLATE_PATH.")
-                st.stop()
-
-            st.title("CBS System Description Generator")
-
-            dxf_file = st.file_uploader("Upload DXF", type=["dxf"])
-            xlsx_file = st.file_uploader("Upload Costing Excel", type=["xlsx", "xlsm"])
-
-            colA, colB, colC = st.columns(3)
-            client_name = colA.text_input("CLIENT'S NAME")
-            pph_count = colB.text_input("PPH COUNT")
-            ipp_rate = colC.text_input("IPP RATE")
-
-            if st.button("Generate System Description Word"):
-                if not dxf_file or not xlsx_file:
-                    st.error("Please upload both DXF and Costing Excel.")
-                    st.stop()
-
-                # Save uploads to disk
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tdxf:
-                    tdxf.write(dxf_file.getbuffer())
-                    dxf_path = Path(tdxf.name)
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tx:
-                    tx.write(xlsx_file.getbuffer())
-                    xlsx_path = Path(tx.name)
-
-                # Extract DXF + metrics
-                with st.spinner("Extracting DXF information..."):
-                    full = extract_full_dxf_info(dxf_path)
-
-                with st.spinner("Computing metrics from DXF..."):
-                    metrics = compute_dxf_metrics(full)
-
-                # Costing values + tables
-                with st.spinner("Reading values from costing sheet..."):
-                    cost_vals = extract_costing_values(xlsx_path)
-
-                with st.spinner("Reading Conveyor BOQ table from costing sheet..."):
-                    tables = extract_costing_tables(xlsx_path)
-
-                # Variables map (placeholders)
-                variables: Dict[str, str] = {}
-
-                # DXF-driven
-                variables["UNIT"] = metrics.get("UNITS", "")
-                variables["Type of CBS"] = metrics.get("TYPE OF CBS", "")
-                variables["COUNT"] = str(metrics.get("TOTAL CONVEYOR / SUBCOMPONENT COUNT", ""))  # overall "COUNT"
-                variables["Feedline count"] = str(metrics.get("FEEDLINE COUNT", ""))
-                variables["DEGREE OF ANGLE MERGE"] = metrics.get("DEGREE OF ANGLE MERGE", "")
-                variables["COUNT OF REJECTION CHUTE"] = str(metrics.get("COUNT OF REJECTION CHUTE", ""))
-                variables["COUNT OF DISPERSION CHUTE"] = str(metrics.get("COUNT OF DISPERSION CHUTE", ""))
-                variables["COUNT OF COLLECTION CHUTE"] = str(metrics.get("COUNT OF COLLECTION CHUTE", ""))
-
-                # Costing-driven
-                variables["CBS HEIGHT FROM GROUND"] = cost_vals.get("CBS HEIGHT FROM GROUND", "")
-                variables["PITCH LENGTH"] = cost_vals.get("PITCH LENGTH", "")
-
-                # User-driven
-                variables["CLIENT'S NAME"] = client_name.strip()
-                variables["CLIENT NAME"] = variables["CLIENT'S NAME"]
-                variables["PPH COUNT"] = pph_count.strip()
-                variables["IPP Rate"] = ipp_rate.strip()
-                variables["IPP RATE"] = ipp_rate.strip()
-
-                # 1) GROQ Detection (primary) + deterministic fallback
-                with st.spinner("Detecting components/subcomponents from DXF (GROQ)..."):
-                    det_txt = groq_chat(prompt_detect_components(full, metrics), temperature=0.1, max_tokens=2500)
-                    det_raw = extract_json(det_txt)
-
-                detected_fallback = build_detected_json(metrics)
-                detected = normalize_detected(det_raw, detected_fallback)
-
-                # Enforce mandatory mapping again (safety net)
-                # FS002 without weighing => buffer conveyor
-                if metrics.get("FS002 WITHOUT WEIGHING COUNT", 0) > 0:
-                    detected.setdefault("Parcel Inducts / Induction to Sorter", {})
-                    detected["Parcel Inducts / Induction to Sorter"].setdefault("Feedlines", {"Feedline Count": int(metrics.get("FEEDLINE COUNT", 1)), "Subcomponents": {}})
-                    detected["Parcel Inducts / Induction to Sorter"]["Feedlines"].setdefault("Subcomponents", {})
-                    detected["Parcel Inducts / Induction to Sorter"]["Feedlines"]["Subcomponents"]["Buffer Conveyor"] = 1
-
-                # VDS loop => Infeed VDS
-                if metrics.get("HAS_VDS_LOOP"):
-                    detected.setdefault("Infeed System", {})
-                    if "VDS Loop Conveyor" not in detected["Infeed System"]:
-                        detected["Infeed System"]["VDS Loop Conveyor"] = max(1, int(metrics.get("VDS LOOP COUNT", 1)))
-
-                # 2) GROQ Write draft (dynamic)
-                with st.spinner("Generating System Description (draft)..."):
-                    sys_desc_draft = groq_chat(
-                        prompt_generate_system_description_dynamic(template_text, detected, variables),
-                        temperature=0.2,
-                        max_tokens=4500
-                    )
-
-                if not (sys_desc_draft or "").strip():
-                    st.error("System description draft came empty. Check GROQ response / template content.")
-                    st.stop()
-
-                # 3) Judge/fix pass
-                with st.spinner("Validating & fixing output (judge pass)..."):
-                    sys_desc_final = groq_chat(
-                        prompt_judge_fix_system_description(detected, sys_desc_draft),
-                        temperature=0.0,
-                        max_tokens=4500
-                    )
-
-                if not (sys_desc_final or "").strip():
-                    st.error("Final system description came empty after judge pass.")
-                    st.stop()
-
-                # 4) Build DOCX
-                out_docx = Path(tempfile.gettempdir()) / "CBS_System_Description.docx"
-                build_docx(
-                    system_description_text=sys_desc_final,
-                    out_path=out_docx,
-                    title="System Description",
-                    tables=tables,
-                    detected=detected
-                )
-
-                if not out_docx.exists() or out_docx.stat().st_size < 500:
-                    st.error("DOCX not generated correctly (file missing/too small).")
-                    st.stop()
-
-                st.success("DOCX generated successfully.")
-
-                with open(out_docx, "rb") as f:
-                    st.download_button(
-                        label="Download System Description DOCX",
-                        data=f,
-                        file_name="CBS_System_Description.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
+        # ...existing code...
+        pass
 
     total = 0
 
@@ -276,7 +132,8 @@ def compute_dxf_metrics(full: Dict[str, Any]) -> Dict[str, Any]:
 
     # FEEDLINES (count)
     feedline_count = _search_counts_multi(full, [
-        r"feedline", r"feed\s*line", r"fal.*feed", r"\bfs\d{3,4}\b", r"\bfs0\d+\b", r"induct"
+        r"feedline", r"feed\s*line", r"fal.*feed", r"\bfs\d{3,4}\b", r"\bfs0\d+\b", r"induct",
+        r"fal[_\-\s]*fs002", r"\bfs002\b", r"fs002v02", r"auto[_\-\s]*induct"
     ])
 
     # Special mapping: FAL_FS002V02 (Without weighing) => Buffer Conveyor
@@ -305,6 +162,8 @@ def compute_dxf_metrics(full: Dict[str, Any]) -> Dict[str, Any]:
         r"fal[_\-\s]*f001", r"\bf001\b",
         r"vipacsystem", r"vipac",
         r"return\s*line", r"return\s*conveyor",
+        r"boom.*conv", r"\bboom\b",  # Boom conveyors are VDS components
+        r"fal.*blk.*boom", r"blk.*boom",
     ])
     has_vds_loop = vds_loop > 0
 
@@ -335,12 +194,35 @@ def compute_dxf_metrics(full: Dict[str, Any]) -> Dict[str, Any]:
     ])
     has_manual = manual_station_count > 0
 
-    # FEEDLINE SUBCOMPONENT SIGNALS (presence-driven)
+    # FEEDLINE SUBCOMPONENT SIGNALS (presence-driven) with actual counts
     loading_sig   = _search_counts_multi(full, [r"\bloading\b", r"\bspacing\b", r"\bspacer\b", r"gap\s*optimizer"])
     buffer_sig    = _search_counts_multi(full, [r"\bbuffer\b", r"accumulation"])
     receiving_sig = _search_counts_multi(full, [r"\breceiving\b", r"\binlet\b", r"\bintake\b"])
     merge_sig     = _search_counts_multi(full, [r"intelligent\s*merge", r"angle\s*merge", r"belt\s*merge", r"\bmerge\b"])
     reject_sig    = _search_counts_multi(full, [r"rejection\s*chute", r"\breject\b", r"sort\s*fail", r"exception"])
+    
+    # Get actual counts for induct conveyors (used for detailed induct section)
+    loading_conveyor_count = _search_counts_multi(full, [
+        r"loading\s*conveyor", r"orientation\s*conveyor", r"static.*loading"
+    ])
+    buffer_conveyor_count = _search_counts_multi(full, [
+        r"buffer\s*conveyor", r"static.*buffer", r"accumulation\s*conveyor"
+    ])
+    intelligent_merge_count = _search_counts_multi(full, [
+        r"intelligent\s*merge", r"angle\s*merge", r"static.*merge", 
+        r"fal[_\-\s]*f007", r"fal[_\-\s]*f012", r"fal[_\-\s]*f002"
+    ])
+    weighing_conveyor_count = _search_counts_multi(full, [
+        r"weighing\s*conveyor", r"static.*weighing", r"scale\s*conveyor",
+        r"fal[_\-\s]*f015"
+    ])
+    spacing_conveyor_count = _search_counts_multi(full, [
+        r"spacing\s*conveyor", r"gap.*conveyor", r"positioning\s*system",
+        r"fal[_\-\s]*f013"
+    ])
+    receiving_conveyor_count = _search_counts_multi(full, [
+        r"receiving\s*conveyor", r"static.*receiving", r"fal[_\-\s]*f003"
+    ])
 
     # TOTAL “conveyor-like” (rough)
     conveyor_like_total = _search_counts_multi(full, [
@@ -383,6 +265,14 @@ def compute_dxf_metrics(full: Dict[str, Any]) -> Dict[str, Any]:
 
         # special mapping visibility
         "FS002 WITHOUT WEIGHING COUNT": fs002_without_weighing,
+
+        # Induct subcomponent actual counts
+        "LOADING CONVEYOR COUNT": loading_conveyor_count,
+        "BUFFER CONVEYOR COUNT": buffer_conveyor_count,
+        "INTELLIGENT MERGE COUNT": intelligent_merge_count,
+        "WEIGHING CONVEYOR COUNT": weighing_conveyor_count,
+        "SPACING CONVEYOR COUNT": spacing_conveyor_count,
+        "RECEIVING CONVEYOR COUNT": receiving_conveyor_count,
 
         # feedline subcomponent presence flags
         "FEEDLINE_HAS_LOADING_OR_SPACING": loading_sig > 0,
@@ -477,9 +367,25 @@ def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 
-def read_block_table(ws, header_row: int, ncols: int, max_rows: int = 200) -> List[List[str]]:
+def read_block_table(ws, header_row: int, ncols: int = None, max_rows: int = 200) -> List[List[str]]:
+    """
+    Read a table from Excel starting at header_row.
+    If ncols is None, auto-detect by finding the last non-empty column in header row.
+    """
     table: List[List[str]] = []
     hdr: List[str] = []
+    
+    # Auto-detect column count if not specified
+    if ncols is None:
+        ncols = 1
+        for c in range(1, 50):  # Check up to 50 columns
+            v = ws.cell(header_row, c).value
+            if v is not None and str(v).strip() != "":
+                ncols = c
+            elif ncols > 1 and v is None:
+                # Found the end (empty cell after non-empty cells)
+                break
+    
     for c in range(1, ncols + 1):
         v = ws.cell(header_row, c).value
         hdr.append("" if v is None else str(v).strip())
@@ -508,7 +414,7 @@ def extract_costing_tables(xlsx_path: Path) -> Dict[str, List[List[str]]]:
 
     if "Conveyors" in wb.sheetnames:
         ws = wb["Conveyors"]
-        tables["Conveyor BOQ"] = read_block_table(ws, header_row=2, ncols=7)
+        tables["Conveyor BOQ"] = read_block_table(ws, header_row=2, ncols=None)
 
         # Bagging Conveyor BOQ (filtered)
         full = tables["Conveyor BOQ"]
@@ -955,149 +861,3 @@ def build_docx(system_description_text: str,
         doc.add_paragraph(line)
 
     doc.save(str(out_path))
-
-# -----------------------------
-# STREAMLIT APP
-# -----------------------------
-st.set_page_config(page_title="DXF + Costing -> System Description (DOCX)", layout="wide")
-
-if not GROQ_API_KEY:
-    st.error("Set GROQ_API_KEY in environment.")
-    st.stop()
-
-template_text = load_template_text()
-if not template_text.strip():
-    st.error("CBS_SYSTEM_DESC.txt not found or empty. Put it next to this script or set CBS_TEMPLATE_PATH.")
-    st.stop()
-
-st.title("CBS System Description Generator")
-
-dxf_file = st.file_uploader("Upload DXF", type=["dxf"])
-xlsx_file = st.file_uploader("Upload Costing Excel", type=["xlsx", "xlsm"])
-
-colA, colB, colC = st.columns(3)
-client_name = colA.text_input("CLIENT'S NAME")
-pph_count = colB.text_input("PPH COUNT")
-ipp_rate = colC.text_input("IPP RATE")
-
-if st.button("Generate System Description Word"):
-    if not dxf_file or not xlsx_file:
-        st.error("Please upload both DXF and Costing Excel.")
-        st.stop()
-
-    # Save uploads to disk
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tdxf:
-        tdxf.write(dxf_file.getbuffer())
-        dxf_path = Path(tdxf.name)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tx:
-        tx.write(xlsx_file.getbuffer())
-        xlsx_path = Path(tx.name)
-
-    # Extract DXF + metrics
-    with st.spinner("Extracting DXF information..."):
-        full = extract_full_dxf_info(dxf_path)
-
-    with st.spinner("Computing metrics from DXF..."):
-        metrics = compute_dxf_metrics(full)
-
-    # Costing values + tables
-    with st.spinner("Reading values from costing sheet..."):
-        cost_vals = extract_costing_values(xlsx_path)
-
-    with st.spinner("Reading Conveyor BOQ table from costing sheet..."):
-        tables = extract_costing_tables(xlsx_path)
-
-    # Variables map (placeholders)
-    variables: Dict[str, str] = {}
-
-    # DXF-driven
-    variables["UNIT"] = metrics.get("UNITS", "")
-    variables["Type of CBS"] = metrics.get("TYPE OF CBS", "")
-    variables["COUNT"] = str(metrics.get("TOTAL CONVEYOR / SUBCOMPONENT COUNT", ""))  # overall "COUNT"
-    variables["Feedline count"] = str(metrics.get("FEEDLINE COUNT", ""))
-    variables["DEGREE OF ANGLE MERGE"] = metrics.get("DEGREE OF ANGLE MERGE", "")
-    variables["COUNT OF REJECTION CHUTE"] = str(metrics.get("COUNT OF REJECTION CHUTE", ""))
-    variables["COUNT OF DISPERSION CHUTE"] = str(metrics.get("COUNT OF DISPERSION CHUTE", ""))
-    variables["COUNT OF COLLECTION CHUTE"] = str(metrics.get("COUNT OF COLLECTION CHUTE", ""))
-
-    # Costing-driven
-    variables["CBS HEIGHT FROM GROUND"] = cost_vals.get("CBS HEIGHT FROM GROUND", "")
-    variables["PITCH LENGTH"] = cost_vals.get("PITCH LENGTH", "")
-
-    # User-driven
-    variables["CLIENT'S NAME"] = client_name.strip()
-    variables["CLIENT NAME"] = variables["CLIENT'S NAME"]
-    variables["PPH COUNT"] = pph_count.strip()
-    variables["IPP Rate"] = ipp_rate.strip()
-    variables["IPP RATE"] = ipp_rate.strip()
-
-    # 1) GROQ Detection (primary) + deterministic fallback
-    with st.spinner("Detecting components/subcomponents from DXF (GROQ)..."):
-        det_txt = groq_chat(prompt_detect_components(full, metrics), temperature=0.1, max_tokens=2500)
-        det_raw = extract_json(det_txt)
-
-    detected_fallback = build_detected_json(metrics)
-    detected = normalize_detected(det_raw, detected_fallback)
-
-    # Enforce mandatory mapping again (safety net)
-    # FS002 without weighing => buffer conveyor
-    if metrics.get("FS002 WITHOUT WEIGHING COUNT", 0) > 0:
-        detected.setdefault("Parcel Inducts / Induction to Sorter", {})
-        detected["Parcel Inducts / Induction to Sorter"].setdefault("Feedlines", {"Feedline Count": int(metrics.get("FEEDLINE COUNT", 1)), "Subcomponents": {}})
-        detected["Parcel Inducts / Induction to Sorter"]["Feedlines"].setdefault("Subcomponents", {})
-        detected["Parcel Inducts / Induction to Sorter"]["Feedlines"]["Subcomponents"]["Buffer Conveyor"] = 1
-
-    # VDS loop => Infeed VDS
-    if metrics.get("HAS_VDS_LOOP"):
-        detected.setdefault("Infeed System", {})
-        if "VDS Loop Conveyor" not in detected["Infeed System"]:
-            detected["Infeed System"]["VDS Loop Conveyor"] = max(1, int(metrics.get("VDS LOOP COUNT", 1)))
-
-    # 2) GROQ Write draft (dynamic)
-    with st.spinner("Generating System Description (draft)..."):
-        sys_desc_draft = groq_chat(
-            prompt_generate_system_description_dynamic(template_text, detected, variables),
-            temperature=0.2,
-            max_tokens=4500
-        )
-
-    if not (sys_desc_draft or "").strip():
-        st.error("System description draft came empty. Check GROQ response / template content.")
-        st.stop()
-
-    # 3) Judge/fix pass
-    with st.spinner("Validating & fixing output (judge pass)..."):
-        sys_desc_final = groq_chat(
-            prompt_judge_fix_system_description(detected, sys_desc_draft),
-            temperature=0.0,
-            max_tokens=4500
-        )
-
-    if not (sys_desc_final or "").strip():
-        st.error("Final system description came empty after judge pass.")
-        st.stop()
-
-    # 4) Build DOCX
-    out_docx = Path(tempfile.gettempdir()) / "CBS_System_Description.docx"
-    build_docx(
-        system_description_text=sys_desc_final,
-        out_path=out_docx,
-        title="System Description",
-        tables=tables,
-        detected=detected
-    )
-
-    if not out_docx.exists() or out_docx.stat().st_size < 500:
-        st.error("DOCX not generated correctly (file missing/too small).")
-        st.stop()
-
-    st.success("DOCX generated successfully.")
-
-    with open(out_docx, "rb") as f:
-        st.download_button(
-            label="Download System Description DOCX",
-            data=f,
-            file_name="CBS_System_Description.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )

@@ -34,17 +34,28 @@ COMPONENT_PATTERNS = {
         r"receiving.*conv", r"highway", r"singulat"
     ],
     "VDS_BUFFER": [
-        r"vds", r"distribution.*loop", r"distribution", r"buffer",
+        r"vds", r"distribution.*loop", r"distribution", 
         r"arm.*vds", r"fal.*s013"
     ],
     "OPERATOR_STATION": [
         r"operator(?!.*safety)", r"manual.*station", r"induct.*station",
         r"manual.*load"
     ],
+    "NON_SORT_CHUTE": [
+        r"big.*parcel.*chute", r"large.*parcel.*chute", r"non.*sort.*chute",
+        r"nonsort.*chute", r"oversize.*chute", r"big.*chute"
+    ],
+    "REJECTION_CHUTE": [
+        r"irregular.*chute", r"irchute", r"ir.*chute",
+        r"exception.*chute", r"error.*chute", r"sortfail"
+    ],
+    "SLIDING_CHUTE": [
+        r"sliding.*chute", r"slide.*chute", r"ptl.*rack", r"ptl\s*\d+x\d+"
+    ],
     "CHUTE": [
         r"chute", r"slide", r"sliding", r"gravity",
         r"live(?!.*load)", r"reject", r"collection.*chute",
-        r"sortfail", r"exception.*chute", r"discharge",
+        r"exception.*chute", r"discharge",
         r"output.*chute", r"parcel.*chute"
     ],
     "PTL": [
@@ -52,8 +63,14 @@ COMPONENT_PATTERNS = {
         r"light.*rack", r"pallet.*setup"
     ],
     "BAG_SYSTEM": [
-        r"bag", r"bagging", r"takeaway", r"trolley",
-        r"roller.*cage"
+        r"bag.*conv", r"bag.*takeaway", r"takeaway.*conv", r"bag.*take.*away",
+        r"bagging.*conv", r"bag.*belt", r"^a\$[a-z0-9]+$"  # A$ blocks are Bag Takeaway Conveyors
+    ],
+    "TROLLEY": [
+        r"trolley", r"roller.*cage", r"cage.*trolley"
+    ],
+    "COLLECTION_BIN": [
+        r"collection.*bin", r"bin.*fal", r"st001"
     ],
     "RECIRCULATION": [
         r"recirculation", r"recirculate", r"refeed",
@@ -88,12 +105,15 @@ STRUCTURAL_PATTERNS = [
 # ==================== HELPER FUNCTIONS ====================
 
 def _is_noise_block(name: str) -> bool:
-    """Filter out anonymous noise blocks."""
+    """Filter out anonymous noise blocks (but NOT A$ blocks - those are Bag Takeaway Conveyors)."""
     n = name.strip()
+    # Filter *U, *D, *X, *A, *T, *E followed by digits (AutoCAD anonymous blocks)
     if re.match(r"^\*[UDXATE]\d+$", n, re.IGNORECASE):
         return True
-    if n.startswith("*") or n.startswith("~") or n.startswith("A$C"):
+    # Filter other noise but NOT A$ blocks (a$xxx or A$xxx are Bag Takeaway Conveyors)
+    if n.startswith("*") or n.startswith("~"):
         return True
+    # Do NOT filter A$ blocks - they are Bag Takeaway Conveyors
     return False
 
 
@@ -142,43 +162,96 @@ def _detect_cbs_type(project_name: str) -> str:
 
 
 def _analyze_chute_types(components: dict) -> dict:
-    """Analyze chute breakdown by examining component names."""
+    """
+    Enhanced chute breakdown analysis from raw DXF block names.
+    
+    Key mappings:
+    - "big parcel chute" -> Non-Sort Chutes (large parcels)
+    - "irregular chute" / "irchute" -> Rejection Chutes
+    - "ptl rack" -> Sliding Chutes (PTL-enabled sliding chutes)
+    - "sliding chute" / "slide chute" -> Sliding Chutes
+    - "chute-XXX" generic pattern -> Generic Chutes
+    """
     chute_analysis = {
         "total": 0,
         "by_type": defaultdict(int),
-        "has_type_info": False
+        "has_type_info": False,
+        "per_zone": {}
     }
     
     for comp_name, count in components.items():
         name_lower = comp_name.lower()
-        if "chute" in name_lower or "slide" in name_lower or "discharge" in name_lower:
+        
+        # Check for Non-Sort Chutes (big parcel chutes)
+        if "big" in name_lower and "parcel" in name_lower:
+            chute_analysis["by_type"]["non_sort_chutes"] += count
             chute_analysis["total"] += count
+            chute_analysis["has_type_info"] = True
+            continue
+        
+        # Check for Rejection/Irregular Chutes
+        if "irregular" in name_lower or "irchute" in name_lower:
+            chute_analysis["by_type"]["rejection_chutes"] += count
+            chute_analysis["total"] += count
+            chute_analysis["has_type_info"] = True
+            continue
+        
+        # Check for PTL Racks -> These are Sliding Chutes
+        if "ptl" in name_lower and ("rack" in name_lower or re.search(r"ptl\s*\d+x\d+", name_lower)):
+            chute_analysis["by_type"]["sliding_chutes"] += count
+            chute_analysis["total"] += count
+            chute_analysis["has_type_info"] = True
+            continue
+        
+        # Only process remaining if relevant
+        if "chute" not in name_lower and "slide" not in name_lower and "discharge" not in name_lower:
+            continue
             
-            # Detect types (order matters - most specific first)
-            if "reject" in name_lower or "sortfail" in name_lower or "exception" in name_lower:
-                chute_analysis["by_type"]["rejection"] += count
-                chute_analysis["has_type_info"] = True
-            elif "collection" in name_lower or "friction" in name_lower or "accumulation" in name_lower:
-                chute_analysis["by_type"]["collection"] += count
-                chute_analysis["has_type_info"] = True
-            elif "live" in name_lower or "active" in name_lower:
-                chute_analysis["by_type"]["live"] += count
-                chute_analysis["has_type_info"] = True
-            elif "sliding" in name_lower or "slide" in name_lower:
-                chute_analysis["by_type"]["sliding"] += count
-                chute_analysis["has_type_info"] = True
-            elif "mini" in name_lower:
-                chute_analysis["by_type"]["mini_gravity"] += count
-                chute_analysis["has_type_info"] = True
-            elif "bulk" in name_lower:
-                chute_analysis["by_type"]["bulk"] += count
-                chute_analysis["has_type_info"] = True
-            elif "big parcel" in name_lower or "parcel" in name_lower:
-                chute_analysis["by_type"]["big_parcel"] += count
-                chute_analysis["has_type_info"] = True
-            elif "gravity" in name_lower:
-                chute_analysis["by_type"]["gravity"] += count
-                chute_analysis["has_type_info"] = True
+        chute_analysis["total"] += count
+        
+        # Detect types (order matters - most specific first)
+        if "reject" in name_lower or "sortfail" in name_lower or "exception" in name_lower:
+            chute_analysis["by_type"]["rejection_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "collection" in name_lower or "friction" in name_lower or "accumulation" in name_lower:
+            chute_analysis["by_type"]["collection_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "live" in name_lower or "active" in name_lower:
+            chute_analysis["by_type"]["live_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "sliding" in name_lower or "slide" in name_lower:
+            chute_analysis["by_type"]["sliding_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "mini" in name_lower:
+            chute_analysis["by_type"]["mini_gravity_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "bulk" in name_lower:
+            chute_analysis["by_type"]["bulk_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "gravity" in name_lower:
+            chute_analysis["by_type"]["gravity_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        elif "discharge" in name_lower:
+            chute_analysis["by_type"]["discharge_chutes"] += count
+            chute_analysis["has_type_info"] = True
+        else:
+            # Generic chute
+            chute_analysis["by_type"]["generic_chutes"] += count
+    
+    return chute_analysis
+
+
+def _calculate_per_zone_chutes(chute_analysis: dict, vds_count: int) -> dict:
+    """Calculate per-zone chute distribution when VDS count is known."""
+    if vds_count <= 0:
+        return chute_analysis
+    
+    per_zone = {}
+    for chute_type, total_count in chute_analysis.get("by_type", {}).items():
+        per_zone[chute_type] = total_count // vds_count
+    
+    chute_analysis["per_zone"] = per_zone
+    chute_analysis["zone_count"] = vds_count
     
     return chute_analysis
 
@@ -233,6 +306,23 @@ def extract_dxf_components(dxf_path: Path, project_name: str = "") -> dict:
     has_recirculation = len(categorized.get("RECIRCULATION", {})) > 0
     has_scanner = len(categorized.get("SCANNER", {})) > 0
     
+    # Get VDS count for per-zone calculations
+    vds_count = 0
+    if has_vds:
+        vds_items = categorized.get("VDS_BUFFER", {})
+        vds_count = sum(item["count"] for item in vds_items.values())
+        if vds_count > 0:
+            chute_analysis = _calculate_per_zone_chutes(chute_analysis, vds_count)
+    
+    # Check for bag takeaway system
+    has_bag_system = len(categorized.get("BAG_SYSTEM", {})) > 0
+    # Also check in UNCATEGORIZED for bag-related items
+    uncategorized = categorized.get("UNCATEGORIZED", {})
+    for comp_name in uncategorized.keys():
+        if "bag" in comp_name.lower() and ("takeaway" in comp_name.lower() or "conv" in comp_name.lower()):
+            has_bag_system = True
+            break
+    
     if has_auto_induct and has_operators:
         induction_type = "MIXED (Auto + Manual)"
     elif has_auto_induct:
@@ -257,6 +347,8 @@ def extract_dxf_components(dxf_path: Path, project_name: str = "") -> dict:
         "cbs_type": cbs_type,
         "induction_type": induction_type,
         "has_vds": has_vds,
+        "vds_count": vds_count,
+        "has_bag_system": has_bag_system,
         "has_recirculation": has_recirculation,
         "has_scanner": has_scanner,
         "total_components": total_components,
