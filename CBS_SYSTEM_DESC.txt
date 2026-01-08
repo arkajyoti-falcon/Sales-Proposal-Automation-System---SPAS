@@ -1,0 +1,256 @@
+# Telescopic belt conveyor - 
+A telescopic belt conveyor, also known as an extendable conveyor or telescoping conveyor, is a type of conveyor system that features a telescoping mechanism to extend or retract the conveyor length as needed. It is commonly used in applications where flexible and 
+adjustable conveying solutions are required, such as loading and unloading trucks or containers in warehouses, distribution centres, and shipping facilities.Some Silent Features of telescopic belt conveyor: 
+• Extendable Sections 
+• Ease of Operation 
+• Space-Saving 
+• Customizable 
+• Labor-Efficient
+
+#Infeed Conveyor - 
+Infeed conveyor system consists of below components: 
+1. Add subcomponent 1 of Infeed System 
+2. Add subcomponent 2 of Infeed System 
+
+# Straight and Inclined Powered Belt Conveyor - 
+Falcon’s Belt Conveyors are modular & robust in design, used for smooth conveying of products over Straight, inclined and declined paths. MS profile is used to build conveyor frame.  The conveyors are supplied with the necessary supports and bolts to fix them to the supporting plane, as well as with the junction elements allowing easy and jam-free passage from one conveyor to the 
+other. 
+Some Silent Features of Falcon’s Belt conveyor: 
+ Low Noise 
+ Maximum uptime. 
+ Minimal maintenance 
+ High safety standards. 
+ Fastest ROI.
+
+# Plastic Modular Conveyor - 
+Falcon’s Belt Conveyors are modular & robust in design. MS profile is used to build conveyor frame. 
+Some Salient Features of Falcon’s Modular Belt conveyor: 
+- Low Noise 
+- Maximum uptime. 
+- Minimal maintenance 
+- High safety standards. 
+- Fastest ROI. 
+
+# Curve Conveyor - 
+Falcon’s curve conveyors are robust and easily maintainable. The uniquely designed curve and belts provides smooth environment to parcels for making the turns. The metal frames of the belts are not deformable to prevent belt misalignment. The belt guide assembly will include removable parts to allow quick replacement in case of damage. 
+
+# Buffer Conveyor - 
+Buffer conveyor is used to temporarily store or hold parcels in a controlled manner. Its primary 
+purpose is to manage the flow of items between different stages of a production or handling process 
+when there is a mismatch in the speeds or capacities of the upstream and downstream equipment. 
+Buffer conveyor is particularly useful in scenarios where there is a discontinuity or variation in the 
+flow rate of items. They allow for a smooth and continuous production or handling process by 
+absorbing temporary surges or gaps in the flow. 
+
+# Belt Merge - 
+This infeed belt conveyor can be used as a merging means with an angle of 30°, 45° and 60° in the 
+same plane. It can be used, for example, as a follow-up conveyor to a sorter or as a feed unit in a 
+collection circuit. 
+The nominal angle of this conveyor is achieved by belt modules of different lengths with self-centering 
+belt belts. The optimum belt tension can be set individually for each belt band.Therefore, it is suitable 
+for applications where a high transport speed is required. 
+The design of the guide rollers allows low-friction operation and low energy consumption; in addition, 
+wear is reduced to a minimum.     
+
+# Angle Merge - 
+In the proposed solution this is 30° triangular high-speed conveyor used for inducting 
+shipment/boxes directly on to the sorter. The Belts are Strip Belts for smooth shipment 
+movement. 
+
+# Aligning Conveyor -
+Powered Aligning Conveyors are meant for aligning the parcels for ease and efficient induction on 
+cross belt carrier. Aligning conveyors typically employ various mechanisms or techniques to achieve 
+proper alignment.  
+By incorporating these alignment mechanisms, an aligning conveyor improves efficiency, reduces 
+product damage, and enhances the overall accuracy of the production or handling process.
+
+# VDS Chutes - 
+A VDS chute is a type of chute used for the smooth descent of materials or objects from an elevated 
+position to a lower level (at an operator level). It utilizes base metal to guide and support the flow of 
+items along the chute & collect the shipments within its area.
+
+# XL Diverter ARM - 
+Arm diverter System of Falcon Autotech is an extremely cost-effective Sortation system. Arm 
+diverter’s simple and modular design gives it advantage of low cost, space saving, and modularity.  
+It utilizes mechanical arms or diverters to direct and distribute parcels, to their designated locations 
+within a distribution network. This system is highly efficient for managing high volumes of items with 
+varying sizes and weights. 
+
+# VDS Loop - 
+VDS Loop is a conveyor-based arrangement in the form of a loop, where parcel move and is 
+manually picked by an operator. It is developed to maintain the smooth operation by 
+recirculating the parcel or product. The VDS loop restricts the parcels to accumulate and cause 
+jams.
+
+# Manual Infeed System - 
+The proposed solution includes [COUNT] manual infeed points—2 for each deck. Operators will place 
+parcels on the infeed conveyors in a singulated manner, with a capacity of minimum [PPH COUNT] parcels 
+per hour. 
+All infeed points are designed to allow shipment feeding from both sides of the conveyor, while also 
+ensuring unobstructed pallet movement to maintain a continuous supply near the operator. 
+
+
+
+---
+
+# Induction to Sorter: Feedlines (variable)
+! If VDS is present - 
+The main purpose of the feedlines is to transport the shipments from the VDS Loop to the sorter by 
+means Loading conveyors, Weighing, Buffer/Spacing Conveyor and Angle Merge conveyors. The flow 
+of shipments on the Inducts are controlled by sensors in such a way that the required gap is ensured 
+between the shipments. 
+These Feedlines are designed especially for Noon considering Operator Ease and ergonmics, where 
+the operator ensures proper placement of the shipments on the Induct.
+
+! If VDS is not present - 
+The main purpose of the feedlines is to receive the Tote/Boxes from the infeed highway lines & induct 
+it Smoothly & accurately onto the sorter by means of receiving conveyors, Weighing, Buffer/Spacing 
+Conveyor and Angle Merge conveyors. The flow of shipments on the Inducts are controlled by sensors 
+in such a way that the required gap is ensured between the Tote/Boxes.  
+Weighing Scales installed on the feedlines will capture the weight of each shipment and will perform 
+weight control to detect out-of-spectrum shipments. 
+The system's design ensures that the maximum capacity of each feed, considered as the sum of the 
+flows from the connected inductions, is always less than the planned induction capacity of 2500 for 
+Totes & Boxes. 
+
+# Feedlines - 
+1. [Type of CBS] CBS has a total [Feedlines Count] Feedlines with [Conveyor Module Count] conveyor modules. Each Feedline has the following Conveyor Modules:
+   • Loading Conveyor- [Loading Conveyor Count] No. 
+   • Buffer Conveyor- [Buffer Conveyor Count] No. 
+   • Intelligent Merge- [Intelligent Merge Count] No.
+
+2. Sensors are placed on the Induct Lines to determine the exact position and dimensions (Length and Width) of the Shipment on the conveyor and prepare the Cross-Belt Cell for receiving the shipment with high precision.
+
+3. Over the feedline, shipments are evenly spaced and smoothly transferred to the main [Type of CBS] CBS.
+
+# Buffer Conveyor- 
+A buffer conveyor, also known as a buffering conveyor or accumulation conveyor, is a type of conveyor 
+system used to temporarily store or hold items in a controlled manner. Its primary purpose is to 
+manage the flow of items between different stages of a production or handling process when there is 
+a mismatch in the speeds or capacities of the upstream and downstream equipment. 
+This Conveyors required to maintain the Throughput of Line.
+
+# Weighing Conveyor- 
+A weighing conveyor, also known as a weigh belt conveyor, is a type of conveyor system specifically 
+designed to measure the weight of materials as they move along the conveyor belt. It combines the 
+functions of conveying and weighing into a single integrated process. 
+Weighing Conveyors equipped with high precision Load Cells to capture the weight of Parcels.
+
+# Receiving Conveyor- 
+A receiving conveyor, also known as an inlet conveyor or an intake conveyor, is a type of conveyor 
+system used to receive and transfer products from the infeed-line into a processing  line. It serves as 
+the initial point of entry where products are collected and conveyed to subsequent stages of the 
+process.
+
+# Spacing Conveyor- 
+A spacing conveyor, also referred to as a gapping conveyor or gap optimizer, is a type of conveyor 
+system used to create and maintain consistent gaps or spacing between items as they move along the 
+conveyor line. Its primary purpose is to regulate the flow and spacing of products to ensure smooth 
+operation and efficient downstream processes. 
+This conveyor is a variable speed special purpose module that creates space between parcels as well 
+as regulates feeding on the Weighing conveyor. 
+
+# Orientation Conveyor 
+An Orientation conveyor is a type of conveyor system used to align & Release the products for 
+induction onto CBS. It serves as the initial point of entry where products are collected and 
+conveyed to subsequent stages of the process. 
+
+# Angle Merge- 
+An Angle/intelligent merge conveyor incorporates advanced automation and control technologies 
+to intelligently merge stream of materials into a single unified flow. It optimizes the merging 
+process by dynamically adjusting the speed and position of items to ensure a smooth and efficient 
+merge. 
+In the proposed solution this is [DEGREE OF ANGLE MERGE] triangular high-speed conveyor used for inducting 
+shipment/boxes directly on to the sorter. The Belts are Strip Belts for smooth shipment 
+movement.  
+
+# Intelligent merge conveyor
+An intelligent merge conveyor is a type of conveyor system that incorporates advanced automation 
+and control technologies to intelligently merge multiple conveyor lines or streams of materials into a 
+single unified flow. It optimizes the merging process by dynamically adjusting the speed and position 
+of items to ensure a smooth and efficient merge.
+
+#Rejection chute
+Each feedline is equipped with a rejection chute. In case of any oversize and overweight shipment 
+detected on feedline, then receiving conveyor will run in reverse direction and drop the shipment in 
+rejection chute. 
+
+# Bag Inducts - 
+[Type of CBS] CBS has one Bag induct comprising of [COUNT] conveyor modules. The operator standing near the 
+induct will scan the barcode of the bag received from the bagging conveyor. 
+
+---
+
+# Main Loop - 
+! Incase of Loop CBS 
+
+•	The Loop CBS sorter is installed at ground level with a sorter height ranging from 2.4 m to 3.5 m.
+•	We have provided loop with Belt Carriers with [PITCH LENGTH] mm pitch and Belt Size of 
+495 x 800mm.                           
+•	As Shipments pass through the Barcode Scanning Tunnel on the Loop, their barcodes are 
+scanned, and chutes are assigned. Once the shipment reaches the respective chute, the carrier 
+carrying the shipment for the chute will actuate and drop the shipment in the assigned chute. 
+
+! Incase of Linear CBS 
+•	The Linear CBS sorter is installed at ground level with a sorter height ranging from 2.4 m to 3.5 m.
+•	We have provided Linear with belt Carriers with [PITCH LENGTH] pitch and Belt Size of 495 x 
+800mm. 
+•	One Linear CBS has a top running length of 81 m & a total length of 164.5 m & 333 number of 
+carriers. 
+•	As Parcel pass through the Barcode Scanning Tunnel on the Linear CBS, their barcodes are 
+scanned, and chutes are assigned. Once the Parcel reaches the respective chute, the carrier 
+carrying the Parcel for the chute will actuate and drop the Parcel in the assigned chute. 
+
+---
+# 5 Side-Automatic Barcode Scanning & Dimensioning System  - 
+Five-Sided Barcode Scanner (ICR) present on Cross Belt Sorter to scan 1D codes and 2D codes. The 
+Scanner is also capable of Archiving Shipment Images in Real time onto a [CLIENT'S NAME] server. 
+
+# Sorting Output - 
+# Gravity Chute -
+A Gravity chute is a type of chute used for the controlled and smooth descent of materials or objects 
+from an elevated position to a lower level. It utilizes a series of rollers to guide 
+
+# Mini-Gravity Chute -
+A Mini Gravity chute is a type of chute used for the controlled and smooth descent of materials or 
+objects from an elevated position to a lower level. It utilizes a series of rollers to guide and support 
+the flow of items along the chute, providing a reliable and efficient transfer method. 
+
+# Bulk Chute - 
+System is installed with 1 bulk chute. Once the bulk output is activated, one of the telescopic belt 
+conveyors starts running in reverse direction i.e. truck loading mode.  The shipments sorted through 
+bulk output will travel PVC belt conveyor & guided through PVC conveyors to one of the TBC 
+conveyor. 
+
+#  Rejection Chute - 
+The system is designed with [COUNT OF REJECTION CHUTE] rejection chute (mini gravity type), As per the requirement of [CLIENT NAME] we have designed an exception handling area of 100 sq. meters in front of rejection chutes 
+area to handle the exception parcels.  
+
+# Dispersion Chute - 
+As per the requirement of LA POSTE, [COUNT OF DISPERSION CHUTE] dispersion chute is also planned to handle the shipments.  
+Dispersion Chute has fixed roller length of 5 meters and  extendable roller block length of 3 meters 
+
+# Direct Bagging Chute - 
+A Direct bagging chute is a type of chute used for the smooth descent of materials or objects from 
+an elevated position to a lower level. It utilizes base metal to guide and support the flow of items 
+along the chute & collect the shipments into bags placed at the end of each chute. 
+
+#Secondary Chute (L-Type)  
+Secondary Chute is a type of chute used for the smooth descent of materials or objects from an 
+elevated position to a lower level. It utilizes base metal to guide and support the flow of items 
+along the chute & end gate can be closed to collect the shipments within its area. 
+
+# Rejection Chute (L-Type) -
+Rejection Chute is a type of chute used for the smooth descent of materials or objects from an 
+elevated position to a lower level. It utilizes base metal to guide and support the flow of items 
+along the chute & end gate can be closed to collect the shipments within its area. 
+
+# Sliding Chute - 
+A Sliding Chutes is used for the smooth descent of materials or objects from an elevated position 
+to a lower level. It utilizes base metal to guide and support the flow of items along the chute & 
+collect the shipments into trolleys placed at the end of each chute. 
+
+# Collection Chute - 
+The system is planned with [COUNT OF COLLECTION CHUTE] collection type chutes for big shipments. The shipments will get 
+sorted inside the collection trolleys from where the operator will pick the shipments, scan their 
+barcode with HHT’s and then place them on their respective pallets.

@@ -1,0 +1,37 @@
+﻿# Environment files with secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# The old .gitignore folder (created by mistake)
+.gitignore_old_folder/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Temp
+tmp_*/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+.ipynb_checkpoints/

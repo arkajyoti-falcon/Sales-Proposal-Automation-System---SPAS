@@ -1,0 +1,207 @@
+DXF_COMPONENT_NAME_MAP = {
+    # -----------------------
+    # PTL SYSTEM
+    # -----------------------
+    "PTL_Rack": "Put-to-Light (PTL) System (PTL rack)",
+    "PTL frame": "Put-to-Light (PTL) System (PTL rack frame)",
+    "Ptl racks 4x3 and 4x3": "Put-to-Light (PTL) System (multi-level PTL racks)",
+    "3x4 PTL Frame (FAL_P006V01) T-1199": "Put-to-Light (PTL) System (3x4 PTL frame)",
+    "3x3 PTL Frame (FAL_P005V01) T-1199": "Put-to-Light (PTL) System (3x3 PTL frame)",
+    "PTL_Gen2": "Put-to-Light (PTL) System (PTL display/device)",
+    "PTL Chute (T-1266)": "Put-to-Light (PTL) System (PTL chute)",
+    "PTL Chute (FAL_C010V01)": "Put-to-Light (PTL) System (PTL chute)",
+
+    # -----------------------
+    # SCANNER / DWS TUNNEL
+    # -----------------------
+    "ECDS (FAL_S012V01)": "Scanner & Dimensioning Tunnel (DWS)",
+    "ECDS (FAL_S012V02)": "Scanner & Dimensioning Tunnel (DWS)",
+    "ATR Vipacsystem +": "Barcode Scanner Tunnel",
+    "Static_ATR Vipacsystem +_001": "Barcode Scanner Tunnel",
+    "Static_Weighing Conveyor (FAL_F015V02)_01": "Weighing Conveyor (DWS)",
+    "Static_Static-Weighing Conveyor (FAL_F015V01)_008": "Weighing Conveyor (DWS)",
+    "WEIGHING_CONVEYOR_3000PPH": "Weighing Conveyor (DWS)",
+
+    # -----------------------
+    # AUTO INDUCT LINE (IFU / POSITION / MERGE)
+    # -----------------------
+    "Static_IFU Conveyor (FAL_F011V02)_01": "Auto Induct IFU Conveyor",
+    "Static_XL IFU Conveyor(FAL_F029V01)_01": "Auto Induct IFU Conveyor (XL)",
+    "Static_Positioning System (FAL_F013V02)_01": "Induct Positioning System",
+    "Static_Positioning System (FAL_F013V01)_1": "Induct Positioning System",
+    "FAL_S011V01 (Positioning System)": "Induct Positioning System",
+    "Static_Intelligent Merge 30 Deg (FAL_F012V02)_01": "Intelligent Merge Conveyor (Induct to sorter)",
+    "Static_Intelligent Merge 30 Deg (FAL_F007V01)_1": "Intelligent Merge Conveyor (Induct to sorter)",
+    "Static_Intelligent Merge 60Deg (FAL_F002V01)_1": "Intelligent Merge Conveyor (Induct to sorter)",
+    "Static_XL Position Detection System(FAL_F032V01)_01": "Position Detection / Sizing System (Induct)",
+    "FAL_S010V02 (Centering System)": "Centering / Aligning Conveyor",
+    "FAL_PRC8V01_aligner": "Aligning Conveyor on Infeed/Induct",
+    "FAL_PC4V01 (S3_MDR Driven PVC Belt Conveyor)": "Powered Belt Conveyor (MDR driven, induct section)",
+
+    # -----------------------
+    # INFEED / RECEIVING / BUFFER
+    # -----------------------
+    "Static_Infeed Or Orientation Conveyor (FAL_F014V02)_01": "Infeed / Orientation Conveyor",
+    "Static_Receiving Conveyor (FAL_F003V01)_1": "Receiving Conveyor (Infeed)",
+    "Static_Buffer Conveyor (FAL_F001V01)_1": "Buffer Conveyor (Infeed)",
+    "Static_Buffer Conveyor (FAL_F001V01)_2": "Buffer Conveyor (Infeed)",
+    "Static_Buffer Conveyor (FAL_F001V01)_3": "Buffer Conveyor (Infeed)",
+    "Receiving Conveyor": "Receiving Conveyor (Infeed)",
+    "LOADING_CONVEYOR_2000PPH": "Manual Infeed / Loading Conveyor (Each loading)",
+    "Mannual Inbound Conveyor": "Manual Inbound Conveyor",
+
+    # -----------------------
+    # TELESCOPIC INFEED
+    # -----------------------
+    "FAL_BLK_Boom Conveyor": "Telescopic Belt Conveyor",
+    "FAl_BLK_Boom Conveyors": "Telescopic Belt Conveyor",
+    "Telescopico a nastro_ingresso": "Telescopic Belt Conveyor",
+
+    # -----------------------
+    # FEEDLINES / HIGHWAYS
+    # -----------------------
+    "FAL_BLK_Feed lineW800 @30°": "Feedline / Highway Conveyor",
+    "FAL_BLK_Feed lineW1000 @30°": "Feedline / Highway Conveyor",
+    "Feedline_2.4k": "Feedline / Highway Conveyor",
+    "F1_Feedline_Conveyor_Block_V1": "Feedline / Highway Conveyor",
+    "3k Dap Feedline": "Feedline / Highway Conveyor",
+
+    # -----------------------
+    # CBS SORTER (LOOP / LINEAR)
+    # -----------------------
+    "Dual CBS Carrier (FAL_S007V01)": "Cross-Belt Sorter Carrier (CBS)",
+    "Single Belt Carrier (FAL_S003V01)": "Cross-Belt Sorter Carrier (Single-belt CBS)",
+    "Dual Belt CBS Straight Section (FAL_S006V02)": "CBS Straight Section",
+    "Dual Belt CBS Straight Section (FAL_S006V01)": "CBS Straight Section",
+    "Dual Belt CBS 45 Deg Turn (FAL_S005V02)": "CBS 45° Curve Section",
+    "Dual Belt CBS 45 Deg Turn (FAL_S005V01)": "CBS 45° Curve Section",
+    "SIngle Belt CBS Straight Section (FAL_S002V02)": "CBS Straight Section (Single belt)",
+    "Single Belt CBS 30 Deg Turn (FAL_S001V02)": "CBS 30° Curve Section",
+    "CBS_Legs_SingleDecker(FAL_S026V02)": "CBS Support Legs (Single deck)",
+    "CBS_Legs_DoubleDecker(FAL_S027V01)": "CBS Support Legs (Double deck)",
+    "Dual Belt CBS Leg Structure (FAL_S008V01)": "CBS Support Structure",
+
+    # -----------------------
+    # VDS LOOP
+    # -----------------------
+    "VDS Chute (T2242)": "VDS Collection Chute",
+    "FAL_S013V01 (VDS Arm)": "VDS Distribution Arm",
+
+    # -----------------------
+    # GENERIC / IRREGULAR CHUTES
+    # -----------------------
+    "Chute-01": "Generic Sortation Chute",
+    "Chute-001": "Generic Sortation Chute",
+    "Chute-002": "Generic Sortation Chute",
+    "Chute-02": "Generic Sortation Chute",
+    "Chute_1": "Generic Sortation Chute",
+    "Roller Cage Chute (T-1241)": "Roller Cage Collection Chute",
+    "Fix Bin Chute": "Fixed Bin Chute",
+    "big parcel chute 2000 mm wide": "Big-parcel Gravity Chute",
+    "Chute for live parcel": "Live Parcel Chute",
+    "Chute for Ob Live on TBC": "Live Dock Chute (to TBC)",
+    "Chute of OB Live Parcels 01": "Live Dock Chute",
+    "Chute for LR Pickup Parcels": "Parcel Pickup Chute",
+    "IRChute-01": "Irregular Parcel Chute",
+    "IRChute-02": "Irregular Parcel Chute",
+    "Irregular Parcel Chute-01": "Irregular Parcel Chute",
+    "Irregular Parcel Chute-001": "Irregular Parcel Chute",
+    "Irregular Parcel Chute-0111": "Irregular Parcel Chute",
+    "Irregular chute with 30 Deg angle": "Irregular Parcel Chute (angled)",
+    "Irregular Chutes re Shift": "Irregular Parcel Chute Group",
+
+    # -----------------------
+    # DIRECT BAGGING CHUTES
+    # -----------------------
+    "Direct Bagging Chute (FAL_C006V01)": "Direct Bagging Chute",
+    "Direct Bagging Churtes 1200 mm pitch": "Direct Bagging Chute (1200mm pitch)",
+    "Direct Bagging Chute 1.1 m pitch": "Direct Bagging Chute (1.1m pitch)",
+    "Direct Bagging Chute 900 mm pitch": "Direct Bagging Chute (900mm pitch)",
+    "Db Chute Updated": "Direct Bagging Chute (double deck)",
+
+    # -----------------------
+    # COLLECTION / SECONDARY CHUTES
+    # -----------------------
+    "Collection Chute 125": "Collection Chute",
+    "Collection Chute (T-1538)": "Collection Chute",
+    "Collection Chute (FAL_C008V01)": "Collection Chute",
+    "Collection Chute for Double Deck Straight": "Double-deck Collection Chute",
+    "Collection Type Chute": "Collection Chute (generic)",
+
+    # -----------------------
+    # MINI GRAVITY / MINI OUTPUT
+    # -----------------------
+    "Chutes$0$Mini gravity 01": "Mini Gravity Chute",
+    "Chutes$0$Mini Gravity Chute": "Mini Gravity Chute Group",
+
+    # -----------------------
+    # BULK OUTPUT
+    # -----------------------
+    "Bulk Chute": "Bulk Output Chute",
+
+    # -----------------------
+    # REJECTION / OW / EXCEPTIONS
+    # -----------------------
+    "Over Weight Chute and Over Dim Chute": "Overweight / Oversize Rejection Chute",
+    "Overweight Chute": "Overweight Rejection Chute",
+    "Overweight_03": "Overweight Rejection Chute",
+    "Rejection Spiral Chute": "Rejection Spiral Chute",
+    "Empty Chute": "Empty Carton / Tote Chute",
+    "Empty Tote Chute": "Empty Tote Chute",
+
+    # (Shadowfax outbound sortfail is mostly layer-based; block naming can be added here if needed.)
+
+    # -----------------------
+    # LIVE DOCK CHUTES (MONDIAL / AMAZON STYLE)
+    # -----------------------
+    "Ob Live Chute for Outbound Docks": "Live Dock Chute (Outbound docks)",
+    "Outbound Live Chutes": "Live Dock Chute Group",
+    "Live Dock Chute Assembly": "Live Dock Chute Assembly",
+    "Live Chute Connected with TBC": "Live Dock Chute (connected to TBC)",
+
+    # -----------------------
+    # SPIRAL CHUTES
+    # -----------------------
+    "Spiral Chute Double Decker": "Spiral Chute (Double deck)",
+    "Spiral Chute Type -D": "Spiral Chute",
+
+    # -----------------------
+    # TRANSFER PLATES / RECIRCULATION
+    # -----------------------
+    "Transfer Plate for Rec line and manual line": "Recirculation / Manual Transfer Plate",
+    "FeedLineTransferPlate": "Feedline Transfer Plate",
+    "FeedLineTransferPlate with 600 mm": "Feedline Transfer Plate (600mm)",
+    "Lower Deck Live Dock Transfer Plate": "Live Dock Transfer Plate (lower deck)",
+
+    # -----------------------
+    # BAG TAKEAWAY / UNDER-CBS CONVEYORS
+    # -----------------------
+    "Filled+Empty tote Conveyor Below CBS_on Ground$0$_ACMFILLEDHALF": "Filled/Empty Tote Conveyor Below CBS",
+    "FAL_FS002V02 1000mmW": "Powered Belt Conveyor (1000mm wide)",
+    "FAL_FS003V01": "Powered Belt Conveyor",
+    "FAL_PC1V02": "Powered Belt Conveyor",
+    "FAL_PC2V02": "Powered Belt Conveyor",
+    "FAL_PC5V02": "Powered Belt Conveyor",
+    "FAL_PMC7V01(1000mm_60_deg)": "Powered Modular Conveyor (60°)",
+    "FAL_PMC9V01(1000mm_30_deg)": "Powered Modular Conveyor (30°)",
+
+    # -----------------------
+    # OPERATORS / PANELS
+    # -----------------------
+    "Operator": "Operator Workstation",
+    "Operators and Panel": "Operator Workstation with Control Panel",
+    "Operator_Panel_with_HHS": "Operator Panel with Handheld Scanner",
+
+    # -----------------------
+    # STORAGE / LOAD UNITS
+    # -----------------------
+    "pallet": "Pallet",
+    "FAL_BLK_DET_Pallet": "Pallet",
+    "FAL_DET_BLK_Pallet": "Pallet",
+    "FAL_BLK_Roller Cage 1300x600": "Roller Cage (1300x600)",
+    "Roller Cage 1000 x 1200": "Roller Cage (1000x1200)",
+    "Roller Cage 1000x1200": "Roller Cage (1000x1200)",
+    "Trolley 1000x1000": "Parcel / Bag Trolley (1000x1000)",
+    "Trolley": "Parcel / Bag Trolley",
+    "Trolly": "Parcel / Bag Trolley",
+}
