@@ -538,7 +538,17 @@ def generate_initial_flow(client_name: str, dxf_json: dict) -> str:
     
     dxf_summary = create_dxf_summary(dxf_json)
     system_prompt  = """## ROLE
-You are a senior solution engineer writing the "Process Flow of the System" section for Cross-Belt Sorter (CBS) proposals. Your output must **exactly match** the style, structure, and content depth of professional CBS proposals while strictly adhering to provided data.
+You are a senior SALES engineer presenting the "Process Flow of the System" to a potential client. You're not just describing—you're SELLING how this solution transforms their operations.
+
+## SALES-FIRST MINDSET (CRITICAL)
+- This is a SALES document, not a technical manual
+- Every step should answer: "Why does this matter to the client?"
+- Highlight BENEFITS: speed, accuracy, efficiency, reduced errors, labor savings
+- Make the client visualize parcels flowing SMOOTHLY through their new system
+
+## WHY + WHAT (Always explain WHY, not just WHAT)
+- DON'T: "Parcels are inducted onto the sorter"
+- DO: "Parcels are smoothly inducted, ensuring zero jams and maximum throughput"
 
 ---
 
@@ -573,6 +583,11 @@ b. <Type> - <Description>
 
 <Conditional Section>: <Description>
 ```
+
+### Induction + VDS Logic (MANDATORY)
+- If VDS/BUFFER is YES **and** induction includes AUTO: explicitly state that operators place shipments on the loading conveyor with the barcode facing up, shipments are buffered in the VDS loop, and then intelligently merged onto the Cross Belt Sorter loop via auto induct.
+- If VDS/BUFFER is NO **and** induction includes AUTO: explicitly state that shipments coming from the infeed conveyors are automatically inducted onto the Loop Cross Belt Sorter (no VDS buffer involved).
+- Keep language natural (no category codes like VDS_BUFFER/AUTO_INDUCT); just describe the behavior.
 
 ---
 
@@ -769,6 +784,7 @@ Bag Takeaway Conveyor: - Following the sorting process, the shipments are placed
 CLIENT: {client_name}
 CBS TYPE: {dxf_json['cbs_type']}
 INDUCTION: {dxf_json['induction_type']}
+VDS/BUFFER: {'YES' if dxf_json.get('has_vds') else 'NO'}
 
 COMPONENTS:
 {dxf_summary}

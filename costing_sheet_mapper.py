@@ -98,6 +98,153 @@ def normalize_text(text: str) -> str:
     return re.sub(r"[\s_\-]+", " ", str(text)).strip().lower()
 
 
+def load_component_sheets(xlsx_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load all sheets from Excel workbook and build component registry.
+    
+    Normalizes sheet names and extracts key values from each sheet.
+    
+    Args:
+        xlsx_path: Path to Excel workbook
+        
+    Returns:
+        Dictionary mapping normalized_sheet_name to:
+        {
+            "sheet_name": original_sheet_name,
+            "table": dataframe_or_rows,
+            "key_values": { extracted important fields }
+        }
+        
+    Example:
+        registry = load_component_sheets("costing.xlsx")
+        # registry["weighing conveyors"]["table"] -> DataFrame
+        # registry["weighing conveyors"]["key_values"] -> {"quantity": 5, ...}
+    """
+    import pandas as pd
+    
+    try:
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    except Exception as e:
+        raise ValueError(f"Failed to load workbook {xlsx_path}: {e}")
+    
+    registry = {}
+    
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        
+        # Normalize sheet name: lowercase, replace underscores/hyphens with space, collapse spaces
+        normalized_name = normalize_text(sheet_name)
+        
+        # Extract table as dataframe
+        try:
+            # Read the sheet using pandas, trying to auto-detect header
+            df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None)
+            
+            # Find header row (first row with mostly non-empty values)
+            header_row = None
+            for idx in range(min(20, len(df))):
+                non_empty = df.iloc[idx].notna().sum()
+                if non_empty >= len(df.columns) * 0.5:  # At least 50% non-empty
+                    header_row = idx
+                    break
+            
+            if header_row is not None and header_row > 0:
+                # Re-read with detected header
+                df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=header_row)
+            elif header_row == 0:
+                # First row is header, re-read to set it properly
+                df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=0)
+            
+            # Clean up the dataframe
+            df = df.dropna(how='all')  # Remove all-empty rows
+            
+        except Exception as e:
+            # Fallback: read as raw rows
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                if any(cell is not None for cell in row):
+                    rows.append(row)
+            df = rows
+        
+        # Extract key values from first few rows and columns
+        key_values = _extract_key_values_from_sheet(ws, sheet_name)
+        
+        registry[normalized_name] = {
+            "sheet_name": sheet_name,
+            "table": df,
+            "key_values": key_values
+        }
+    
+    return registry
+
+
+def _extract_key_values_from_sheet(ws: Worksheet, sheet_name: str) -> Dict[str, Any]:
+    """
+    Extract important field values from a worksheet.
+    
+    Looks for common patterns like "Quantity: 5", "Total: 100", etc.
+    
+    Args:
+        ws: openpyxl Worksheet
+        sheet_name: Name of the sheet (for context)
+        
+    Returns:
+        Dictionary of extracted key-value pairs
+    """
+    key_values = {}
+    
+    # Common patterns to look for
+    patterns = {
+        "quantity": [r"qty", r"quantity", r"count", r"total\s+qty"],
+        "length": [r"length", r"total\s+length"],
+        "width": [r"width", r"carrier"],
+        "speed": [r"speed\s*\("],
+        "pitch": [r"pitch"],
+        "total": [r"total", r"sum"],
+        "diameter": [r"diameter", r"dia"],
+        "capacity": [r"capacity"],
+    }
+    
+    # Scan first 50 rows and columns for key-value pairs
+    for row_idx in range(min(50, ws.max_row + 1)):
+        for col_idx in range(1, min(10, ws.max_column + 1)):
+            cell = ws.cell(row_idx, col_idx)
+            cell_value = cell.value
+            
+            if not cell_value or not isinstance(cell_value, str):
+                continue
+            
+            cell_norm = normalize_text(cell_value)
+            
+            # Check if this cell matches any pattern
+            for key, patterns_list in patterns.items():
+                for pattern in patterns_list:
+                    if re.search(pattern, cell_norm, re.IGNORECASE):
+                        # Look at next cell for the value
+                        next_cell = ws.cell(row_idx, col_idx + 1)
+                        next_value = next_cell.value
+                        
+                        if next_value is not None:
+                            try:
+                                # Try to extract numeric value
+                                if isinstance(next_value, (int, float)):
+                                    key_values[key] = next_value
+                                elif isinstance(next_value, str):
+                                    # Try to extract number from string
+                                    num_match = re.search(r"[-+]?(\d+\.?\d*)", next_value)
+                                    if num_match:
+                                        try:
+                                            key_values[key] = float(num_match.group(0))
+                                        except ValueError:
+                                            key_values[key] = next_value
+                                    else:
+                                        key_values[key] = next_value
+                            except Exception:
+                                pass
+    
+    return key_values
+
+
 class CostingSheetMapper:
     """Main class for mapping and extracting component data from costing sheets"""
     

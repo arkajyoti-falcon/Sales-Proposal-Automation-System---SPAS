@@ -43,6 +43,15 @@ from docx import Document
 from docx.shared import Pt, Inches
 from dotenv import load_dotenv
 
+# New dynamic system description pipeline
+from costing_sheet_mapper import load_component_sheets
+from dynamic_system_description import (
+    DXFComponent,
+    generate_dynamic_system_description,
+    load_catalog,
+    normalize_name,
+)
+
 load_dotenv()
 st.cache_data.clear()
 # -----------------------------
@@ -287,6 +296,50 @@ def extract_dxf_full_json(dxf_path: Path) -> Dict[str, Any]:
         "block_definitions": block_defs,
         "entity_types": dict(entity_types),
     }
+
+
+def _resolve_stage_from_catalog(name: str, catalog: Dict[str, Any]) -> Optional[str]:
+    """Return stage for a component name using catalog exact/alias lookup."""
+    norm_name = normalize_name(name)
+    if norm_name in catalog:
+        return catalog[norm_name].get("stage")
+
+    for base_name, data in catalog.items():
+        aliases = [normalize_name(a) for a in data.get("aliases", [])]
+        if norm_name in aliases:
+            return data.get("stage")
+    return None
+
+
+def build_dxf_components(full_dxf: Dict[str, Any], catalog: Dict[str, Any]) -> List[DXFComponent]:
+    """Build DXFComponent list from DXF extraction using catalog for stage mapping."""
+    components: List[DXFComponent] = []
+    seen: set = set()
+
+    def _maybe_add(raw_name: str):
+        if not raw_name:
+            return
+        if is_noise_block(raw_name):
+            return
+        norm = normalize_name(raw_name)
+        if not norm or norm in seen:
+            return
+        stage = _resolve_stage_from_catalog(norm, catalog)
+        components.append(DXFComponent(name=raw_name, stage=stage, raw=raw_name))
+        seen.add(norm)
+
+    for name in (full_dxf.get("nested_inserts") or {}).keys():
+        _maybe_add(name)
+    for name in (full_dxf.get("top_inserts") or {}).keys():
+        _maybe_add(name)
+    for name in (full_dxf.get("block_definitions") or []):
+        _maybe_add(name)
+    for name in (full_dxf.get("layers") or {}).keys():
+        _maybe_add(name)
+    for name in (full_dxf.get("text_snips") or {}).keys():
+        _maybe_add(name)
+
+    return components
 
 
 def _search_counts_multi(full: Dict[str, Any], patterns: List[str]) -> int:
@@ -1744,47 +1797,39 @@ def generate_system_description(
     temperature_detect: float = 0.1,
     temperature_write: float = 0.1,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, List[List[str]]]]:
-    template_text = template_override_text if template_override_text is not None else load_template_text()
+    # New dynamic pipeline: no hallucinated components
+    catalog = load_catalog()
 
     full_dxf = extract_dxf_full_json(dxf_path)
     metrics = compute_dxf_metrics(full_dxf)
 
-    tables: Dict[str, List[List[str]]] = {}
-    costing_values: Dict[str, str] = {}
+    # Build DXF components list (raw names only from DXF)
+    dxf_components = build_dxf_components(full_dxf, catalog)
+
+    # Load Excel registry (normalized sheet names → table/key_values)
+    excel_registry: Dict[str, Dict[str, Any]] = {}
     if xlsx_path is not None and xlsx_path.exists():
-        tables = extract_costing_tables(xlsx_path)
-        costing_values = extract_costing_values(xlsx_path)
+        excel_registry = load_component_sheets(str(xlsx_path))
 
-    # Filter Conveyor BOQ to ONLY requested columns
-    if "Conveyor BOQ" in tables and tables["Conveyor BOQ"]:
-        tables["Conveyor BOQ"] = filter_conveyor_boq_columns(tables["Conveyor BOQ"])
-
-    variables = build_variables_map(metrics, costing_values)
-    fallback_detected = build_detected_json(metrics)
-
-    detected_txt = groq_chat(prompt_detect_components(full_dxf, metrics),
-                             temperature=temperature_detect,
-                             max_tokens=6000)
-    detected_raw = extract_json(detected_txt)
-    detected = normalize_detected(detected_raw, fallback_detected)
-
-    # Enforce: infeed subcomponents (ONLY if found in DXF)
-    detected = enforce_infeed_subcomponents_from_dxf(detected, metrics, full_dxf)
-
-    # Enforce: induct subcomponents (ONLY if found in DXF) + correct names + buffer classification
-    detected = enforce_induct_subcomponents_from_dxf(detected, metrics, full_dxf)
-
-    draft_txt = groq_chat(
-        prompt_generate_system_description_dynamic(template_text, detected, variables),
-        temperature=temperature_write,
-        max_tokens=8000,
+    # Generate dynamic system description
+    use_polish = temperature_write > 0.5
+    final_txt, diagnostics = generate_dynamic_system_description(
+        dxf_components=dxf_components,
+        excel_registry=excel_registry,
+        catalog=catalog,
+        use_lm_polish=use_polish,
+        groq_api_key=GROQ_API_KEY if use_polish else None,
     )
 
-    judged_txt = groq_chat(
-        prompt_judge_fix_system_description(detected, draft_txt),
-        temperature=0.0,
-        max_tokens=8000,
-    )
+    # Build tables map for matched components (only one per component)
+    tables: Dict[str, List[List[str]]] = {}
+    for reg_name, reg_entry in excel_registry.items():
+        table = reg_entry.get("table")
+        if table is not None:
+            tables[reg_entry.get("sheet_name", reg_name)] = table
 
-    final_txt = judged_txt
-    return final_txt, detected, metrics, tables
+    # Mandatory diagnostics (rendered, missing mappings)
+    diagnostics.setdefault("dxf_components_count", len(dxf_components))
+    diagnostics.setdefault("rendered_components_count", diagnostics.get("total_components", 0))
+
+    return final_txt, diagnostics, metrics, tables

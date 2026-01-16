@@ -638,17 +638,33 @@ def call_groq_for_process_flow(
     comp_summary = _summarise_components_for_prompt(dxf_json)
 
     system_prompt = """
-You are a senior solution engineer at an automation company.
+You are a senior sales engineer at Falcon Autotech explaining the system flow to a client.
 Write the 'Process Flow of the System' as a numbered list with storytelling narrative.
+
+## 🎯 SALES + BENEFITS FOCUS (CRITICAL)
+- This is NOT a dry technical manual—it's a story about how the client's operations will IMPROVE
+- Every step should subtly answer: "Why does this matter to the client?"
+- Highlight speed, accuracy, efficiency, reduced errors, labor savings where relevant
+- Make the client visualize their parcels flowing smoothly through the system
+
+## 💡 WHY + WHAT (Always explain WHY, not just WHAT)
+- DON'T: "Parcels are inducted onto the sorter"
+- DO: "Parcels are smoothly inducted onto the sorter, ensuring zero jams and maximum throughput"
+- DON'T: "Barcodes are scanned"
+- DO: "Barcodes are scanned instantly, enabling precise routing to the correct destination without manual intervention"
+
+## 🗣️ HUMAN STORYTELLING STYLE
+- Write like you're walking the client through their future warehouse
+- Use simple, conversational English—not technical jargon
+- Transitional language: "From here...", "This feeds into...", "Your parcels then...", "Finally..."
+- Sound confident and helpful, like a trusted advisor
 
 Rules:
 - Output ONLY a numbered list, 5–10 main steps.
 - Each step: '<number>. <Short Title>: <description>'.
-- STORYTELLING REQUIREMENT: Each step must naturally connect to and flow into the next step. Sentences should be meaningful, complete, and show how material/parcels progress through each stage.
-- Use transitional language to link steps (e.g., "From here...", "These parcels then...", "The sorted items are directed to...", "Finally...").
+- Each step must naturally connect to and flow into the next step.
 - Describe realistic material flow: infeed → distribution/buffer → induct → sorter → chutes / PTL / bagging / recirculation as indicated.
 - Use component hints from the DXF summary (telescopic, infeed, VDS, auto induct, CBS, PTL, chute, bagging, etc.).
-- Each step should explain not just WHAT happens, but HOW it connects to the previous step and WHY it leads to the next step.
 - No intro/outro text, no headings, no bullets outside the numbered steps.
 """
 

@@ -114,12 +114,13 @@ def validate_context_counts(ctx: ProposalContext) -> List[str]:
 
 # ==================== SECTION OUTPUT SANITIZER ====================
 def sanitize_section_output(text: str) -> str:
-    """Remove LLM meta-artifacts from generated section text.
+    """Remove LLM meta-artifacts and style objects from generated section text.
     
     Removes:
     - Code fences (```...```)
     - Lines starting with: Reasoning, Corrected, Explanation, Notes, ---
     - Model preamble like "Here is the corrected..."
+    - Stringified style objects like _ParagraphStyle('List Bullet')
     - If multiple blocks exist, keeps the largest proposal-like block
     """
     if not text:
@@ -127,6 +128,9 @@ def sanitize_section_output(text: str) -> str:
     
     # Remove code fences (```markdown, ```text, ``` etc)
     text = re.sub(r'```(?:\w+)?\s*\n?', '', text, flags=re.IGNORECASE)
+    
+    # Remove stringified Python style objects (e.g., _ParagraphStyle('List Bullet') id: 2101683332640)
+    text = re.sub(r"_\w*Style\(['\"][^'\"]*['\"]\)\s*(?:id:\s*\d+)?", '', text, flags=re.IGNORECASE)
     
     # Remove meta-heading lines
     meta_patterns = [
@@ -1376,62 +1380,129 @@ except Exception as e:
     logger.warning(f"Could not initialize output folder: {e}")
 
 
-def rephrase_feedback_to_actionable(feedback: str, section_content: str = None) -> dict:
+def rephrase_feedback_to_actionable(feedback: str, section_content: str = None, all_sections_content: dict = None) -> dict:
     """
     Use LLM to rephrase user feedback into clear, actionable instructions.
     This helps standardize various ways users might express the same intent.
     
-    If section_content is provided, the LLM will find the actual old value from the content.
+    Enhanced to handle short/cryptic user inputs by analyzing full section context.
+    
+    Args:
+        feedback: User's feedback string
+        section_content: Content of the identified target section
+        all_sections_content: Dict of all section contents for comprehensive analysis
     """
-    # Build context about section content if available
+    # Build comprehensive context about ALL section contents
     content_context = ""
+    
     if section_content:
         content_context = f"""
 
-SECTION CONTENT TO ANALYZE:
+TARGET SECTION FULL CONTENT:
 \"\"\"
-{section_content[:3000]}
+{section_content}
 \"\"\"
+"""
+    
+    # Add context from all sections if available
+    if all_sections_content:
+        all_content_preview = "\n\nALL SECTIONS SUMMARY (for context):\n"
+        for key, content in all_sections_content.items():
+            section_name = key.replace("section_content_", "").replace("_", " ").title()
+            preview = content[:500] if content else "[Empty]"
+            all_content_preview += f"\n--- {section_name} ---\n{preview}\n"
+        content_context += all_content_preview
 
-IMPORTANT: You have access to the actual section content above. 
-When the user wants to change something (like offer reference, client name, throughput, etc.),
-find the ACTUAL current value from the section content above and use it as old_value.
-DO NOT use placeholders like [CURRENT_VALUE] - find the real value from the content."""
+    system_prompt = f"""You are an expert at understanding and rephrasing user feedback for Cross-Belt Sorter proposal documents.
 
-    system_prompt = f"""You are an expert at understanding and rephrasing user feedback for document editing.
-Your task is to:
-1. Understand what the user wants to change
-2. Rephrase it into clear, specific, actionable instructions
-3. Extract key entities (names, values, terms) that need to be changed
+## YOUR TASK:
+1. Understand what the user wants to change (even from very short inputs)
+2. Identify the EXACT current value from section content
+3. Extract the EXACT new value the user wants
+4. Rephrase into clear, actionable instructions
 
-CRITICAL RULES:
-- old_value: MUST be the EXACT current value from the section content (not a placeholder!)
-- new_value: The exact new value the user wants
-- If you cannot find the old value in the content, leave old_value as empty string ""
+## CRITICAL RULES FOR HANDLING SHORT/CRYPTIC USER INPUTS:
 
-Examples with section content:
-- User says "change offer reference to FA-9999" and content has "Offer Ref: FA-2024-001" → old_value: "FA-2024-001", new_value: "FA-9999"
-- User says "update throughput to 50000" and content has "throughput of 30,000 PPH" → old_value: "30,000", new_value: "50,000"
-- User says "change client name to ABC Corp" and content has "Dear Zepto Team" → old_value: "Zepto", new_value: "ABC Corp"
+### Rule 1: Component Count Changes
+**Pattern:** User says something like "Direct Bagging chute - 42" or "gravity chutes 127" or "feedlines: 8"
+**What to do:**
+- Look for ANY mention of this component in the section content
+- Find the CURRENT count for this component (e.g., "41 direct bagging chutes")
+- Set old_value to the CURRENT count (e.g., "41")
+- Set new_value to the NEW count from user (e.g., "42")
+- Set target to the component name (e.g., "direct_bagging_chutes")
+- Create actionable_instruction like "Change direct bagging chutes count from 41 to 42"
+
+### Rule 2: Technical Values
+**Pattern:** User says "throughput 50000" or "PPH: 30000" or "capacity 45K"
+**What to do:**
+- Search for throughput/PPH/capacity mentions in content
+- Extract current value (e.g., "27,600 PPH")
+- Set old_value to current (e.g., "27,600" or "27600")
+- Set new_value to user's value (e.g., "50000")
+- Set target to "throughput_pph" or "capacity"
+
+### Rule 3: Reference Numbers/Codes
+**Pattern:** User says "offer FA-2025-001" or "reference: ABC-123"
+**What to do:**
+- Find current offer/reference in content
+- Extract exact current value
+- Set new value to user's input
+- Set target to "offer_reference"
+
+### Rule 4: Names/Entities
+**Pattern:** User says "client Amazon" or "executives: John, Jane" or "project XYZ"
+**What to do:**
+- Search for client names, executive names, project names in content
+- Extract current values
+- Set new values from user input
+
+## EXAMPLES WITH SHORT INPUTS:
+
+**Example 1: Component Count**
+User: "Direct Bagging chute - 42"
+Content has: "41 direct bagging chutes for sorted parcels"
+→ old_value: "41", new_value: "42", target: "direct_bagging_chutes"
+→ actionable_instruction: "Change direct bagging chutes count from 41 to 42"
+
+**Example 2: Throughput**
+User: "throughput 50000"
+Content has: "system throughput of 27,600 PPH"
+→ old_value: "27,600", new_value: "50,000", target: "throughput_pph"
+→ actionable_instruction: "Update system throughput from 27,600 PPH to 50,000 PPH"
+
+**Example 3: Gravity Chutes**
+User: "gravity chutes 127"
+Content has: "There are 86 gravity chutes"
+→ old_value: "86", new_value: "127", target: "gravity_chutes"
+→ actionable_instruction: "Change gravity chutes count from 86 to 127"
+
+**Example 4: Feedlines**
+User: "feedlines: 8"
+Content has: "4 automatic induct lines"
+→ old_value: "4", new_value: "8", target: "feedlines"
+→ actionable_instruction: "Change feedlines count from 4 to 8"
 {content_context}
 
-Return ONLY valid JSON in this format:
+## OUTPUT FORMAT (JSON ONLY):
 {{
-    "original_feedback": "the original user feedback",
-    "actionable_instruction": "Clear instruction like 'Replace X with Y' or 'Change throughput from X to Y'",
+    "original_feedback": "the exact user input",
+    "actionable_instruction": "Clear instruction like 'Change direct bagging chutes from 41 to 42'",
     "action_type": "replace|add|remove|modify|rephrase",
     "entities": {{
-        "old_value": "EXACT current value found in content (NOT a placeholder)",
-        "new_value": "exact new value to use",
-        "target": "what element is being changed (e.g., throughput, client name, capacity, offer reference)"
+        "old_value": "EXACT current value found in content (e.g., '41', '27600', 'Zepto')",
+        "new_value": "exact new value from user (e.g., '42', '50000', 'Amazon')",
+        "target": "what is being changed (e.g., 'direct_bagging_chutes', 'throughput_pph', 'client_name')"
     }},
-    "intent_summary": "One sentence summary of user intent"
+    "intent_summary": "One sentence summary of what user wants"
 }}
 
-IMPORTANT: 
-- NEVER use placeholder values like [CURRENT_VALUE], [CURRENT_OFFER_REFERENCE], etc.
-- Find the ACTUAL value from the section content
-- If you cannot find it, leave old_value as empty string"""
+## CRITICAL:
+- NEVER use placeholders like [CURRENT_VALUE], [CURRENT_OFFER_REFERENCE]
+- ALWAYS find ACTUAL current value from section content
+- Handle very short inputs intelligently by analyzing context
+- If you cannot find current value, leave old_value as empty string "" but still process new_value
+"""
 
     def api_call():
         return groq_client.chat.completions.create(
@@ -1463,15 +1534,17 @@ def identify_section_with_context(feedback: str, actionable_info: dict, stored_s
     Use LLM to identify which section the feedback refers to by analyzing:
     1. The rephrased actionable feedback
     2. The actual content of stored sections (to find where changes apply)
+    
+    Enhanced with comprehensive section content for better identification.
     """
-    # Build section previews from stored content
+    # Build FULL section previews from stored content (not just 300 chars)
     section_previews = []
     for section_key, section_info in PROPOSAL_SECTIONS.items():
         content_key = f"section_content_{section_key}"
         content = stored_sections.get(content_key, "")
         if content:
-            # Get first 300 chars as preview
-            preview = content[:300].replace('\n', ' ').strip()
+            # Use more content for better matching (up to 1500 chars)
+            preview = content[:1500].replace('\n', ' ').strip()
             section_previews.append(f"- {section_key} ({section_info['name']}): \"{preview}...\"")
         else:
             section_previews.append(f"- {section_key} ({section_info['name']}): [No content stored]")
@@ -1546,6 +1619,8 @@ def regenerate_section_with_feedback(section_key: str, original_content: str, us
     """
     Regenerate a specific section incorporating the user's feedback.
     Uses actionable_info for precise instructions.
+    
+    Handles both modifications (change values) and removals (delete entire subsections).
     """
     section_info = PROPOSAL_SECTIONS.get(section_key, {})
     section_name = section_info.get("name", section_key)
@@ -1556,8 +1631,44 @@ def regenerate_section_with_feedback(section_key: str, original_content: str, us
     entities = actionable_info.get("entities", {})
     old_value = entities.get("old_value", "")
     new_value = entities.get("new_value", "")
+    target = entities.get("target", "")
     
-    system_prompt = f"""You are an expert proposal writer at Falcon Autotech.
+    # Determine if this is a removal action
+    is_removal = (
+        action_type == "remove" or 
+        (new_value and new_value.lower() in ["none", "remove", "delete"]) or
+        (not new_value and any(word in actionable_instruction.lower() for word in ["remove", "delete", "eliminate", "no "]))
+    )
+    
+    # Build removal-aware system prompt
+    if is_removal and target:
+        # For removals, provide specific guidance
+        system_prompt = f"""You are an expert proposal writer at Falcon Autotech.
+You need to modify the "{section_name}" section by REMOVING a specific component/subsection.
+
+REMOVAL REQUEST:
+- Target: {target}
+- Instruction: {actionable_instruction}
+- User said: {user_feedback}
+
+CRITICAL RULES FOR REMOVAL:
+1. FIND the subsection/paragraph that describes {target}
+   - Look for: "Manual Induct Station", "manual induct", "operator", etc. (related keywords)
+   - May appear in numbered lists (1., 2., 3.) or (a., b., c.) or as standalone paragraphs
+2. REMOVE that entire subsection:
+   - Delete the heading/title line (e.g., "3. Manual Induct Station:")
+   - Delete ALL paragraphs describing it
+   - Delete any blank lines immediately after it
+3. DO NOT remove any other content
+4. Renumber remaining items if in a numbered list (e.g., 1, 2, 3... stays 1, 2 after removing 2)
+5. For lettered lists (a., b., c.), keep letters as-is after removal
+6. Keep the overall section structure intact and readable
+7. Preserve all formatting and style
+
+Return ONLY the modified section with target completely removed. No explanations."""
+    else:
+        # For modifications
+        system_prompt = f"""You are an expert proposal writer at Falcon Autotech.
 You need to modify the "{section_name}" section of a proposal based on specific instructions.
 
 MODIFICATION DETAILS:
@@ -1567,10 +1678,15 @@ MODIFICATION DETAILS:
 
 CRITICAL RULES:
 1. ONLY make the specific change requested - do NOT modify anything else
-2. Keep the exact same format, structure, and length as the original
-3. Preserve all technical details, dates, and other information not being changed
-4. If replacing names/values, ensure proper capitalization and formatting
-5. The output should be the complete section, not just the changed part
+2. Keep the exact same format, structure, and LENGTH as the original
+3. Preserve ALL formatting: bold, italics, spacing, capitalization, lists, structure
+4. When replacing values:
+   - Find exact match and replace ONLY that text
+   - Do not change text around the value
+   - Keep sentence structure identical
+   - Keep capitalization and spacing exactly as is
+5. Preserve all technical details, dates, and other information not being changed
+6. The output should be the complete section, not just the changed part
 
 Context:
 - Client: {context.get('client_name', 'N/A')}
@@ -1584,7 +1700,9 @@ Return ONLY the modified section content. No explanations, no markers."""
 REQUESTED CHANGE:
 {actionable_instruction}
 
-Please output the modified {section_name} with ONLY the requested change applied. Keep everything else exactly the same."""
+User feedback: {user_feedback}
+
+Please output the modified {section_name} with ONLY the requested change applied. Keep everything else exactly the same (same formatting, capitalization, structure)."""
 
     def api_call():
         return groq_client.chat.completions.create(
@@ -3949,6 +4067,7 @@ STRICT LENGTH LIMIT: Maximum 300 words to ensure single-page fit. Be concise and
    - **MANDATORY: Include the high-level process flow summary if provided**. Mention key system components naturally in a single sentence (e.g., "The proposed solution includes automatic induct conveyors, {cbs_type} for efficient sortation, and output chutes for sorted parcel handling").
    - **CRITICAL: Use the EXACT CBS TYPE** from the context (either "Linear CBS" or "Loop CBS") - do NOT use generic "cross-belt sorter"
    - Highlight any specific technical values, quantities, or capacities if mentioned (e.g., "200 destinations", "5 camera scanner systems", "2 speed settings").
+    - **MANDATORY PPH LINE**: If a PPH value is provided in the context, include a clear sentence such as "From a technical point of view, the system is designed at {PPH} PPH and ensures simple operations and movement within the facility." Use the actual PPH number from the provided data; if not provided, do not invent a value and skip this sentence.
    - Keep this brief but informative - demonstrate technical understanding without overwhelming detail.
    - Mention that the detailed technical proposal is laid out in various sections to provide full insight into the proposed solution.
 
@@ -3995,7 +4114,8 @@ CRITICAL REQUIREMENTS:
 1. The cover letter MUST fit within a single page (maximum 300 words).
 2. If process_flow_summary is provided, ALWAYS incorporate it naturally into the letter body to demonstrate technical understanding.
 3. Mention any specific quantities or technical details from the summary to add credibility.
-4. Keep the tone professional, warm, and client-focused like the example letter provided.
+4. If PPH (parcels per hour) is present in the provided data/counts, include a sentence in the technical paragraph: "From a technical point of view, the system is designed at {PPH} PPH and ensures simple operations and movement within the facility." Use the actual PPH value; if PPH is missing, skip this sentence (do not invent values).
+5. Keep the tone professional, warm, and client-focused like the example letter provided.
 
 Return ONLY the cover letter text, without markdown code fences or extra commentary.
 """
@@ -6648,6 +6768,12 @@ def call_groq_cover_letter(
     """Call Groq API to generate the cover letter text."""
     counts_block = context.counts_block_text() + "\n\n" if context else ""
     gating_issues = validate_context_counts(context) if context and ENABLE_CONTEXT_UNIFICATION else []
+    
+    # Extract PPH from context (or use placeholder)
+    pph_value = "Not specified"
+    if context and context.pph is not None:
+        pph_value = f"{context.pph:,} PPH"
+    
     user_prompt = (
         counts_block + COVER_LETTER_USER_PROMPT_TEMPLATE.format(
             client_name=client_name,
@@ -6660,6 +6786,7 @@ def call_groq_cover_letter(
             process_flow_summary=process_flow_summary.strip() or "Not provided",
             sender_name=sender_name,
             sender_title=sender_title,
+            PPH=pph_value,
         ) + (
             "\n\nIf any counts are missing, avoid inventing numbers; use safe phrasing without quantities." if gating_issues else ""
         )
@@ -7516,10 +7643,10 @@ if st.session_state.page == "preview" and "generated_pdf_buffer" in st.session_s
     """, unsafe_allow_html=True)
     
     
-    # Create two-column layout: Chat | PDF Preview
-    chat_col, pdf_col = st.columns([1, 1.2])
+    # Create two-column layout: PDF Preview | Chat
+    pdf_col, chat_col = st.columns([2.3, 1], gap="medium")
     
-    # ==================== LEFT COLUMN: CHAT & CONTROLS ====================
+    # ==================== RIGHT COLUMN: CHAT & CONTROLS ====================
     with chat_col:     
         # Chat container with scrollable history
         chat_container = st.container(height=380)
@@ -7560,9 +7687,13 @@ if st.session_state.page == "preview" and "generated_pdf_buffer" in st.session_s
                 if key.startswith("section_content_")
             }
             
-            # Initial quick parse to get section (without detailed old/new values yet)
+            # Initial quick parse to get section (with ALL section content for context)
             with st.spinner("Analyzing request..."):
-                initial_actionable = rephrase_feedback_to_actionable(user_feedback, None)
+                initial_actionable = rephrase_feedback_to_actionable(
+                    user_feedback, 
+                    section_content=None,
+                    all_sections_content=stored_sections
+                )
             
             with st.spinner("Identifying target section..."):
                 section_result = identify_section_with_context(user_feedback, initial_actionable, stored_sections)
@@ -7583,9 +7714,13 @@ if st.session_state.page == "preview" and "generated_pdf_buffer" in st.session_s
                 original_content = st.session_state.get(stored_content_key, None)
                 
                 if original_content:
-                    # Step 2: NOW rephrase with the actual section content to find real old values
+                    # Step 2: NOW rephrase with the actual section content AND all sections for comprehensive analysis
                     with st.spinner("Processing changes..."):
-                        actionable_info = rephrase_feedback_to_actionable(user_feedback, original_content)
+                        actionable_info = rephrase_feedback_to_actionable(
+                            user_feedback, 
+                            section_content=original_content,
+                            all_sections_content=stored_sections
+                        )
                     
                     # Get context for regeneration
                     context = {
@@ -7678,25 +7813,101 @@ if st.session_state.page == "preview" and "generated_pdf_buffer" in st.session_s
                             updated_sections = []
                             changes_counter = [0]  # Using list to allow modification in nested functions
                             
-                            # Helper function to replace text in paragraph while preserving some formatting
+                            # Helper function to replace text in paragraph while PRESERVING formatting
                             def replace_in_paragraph(para, old_text, new_text):
+                                """Replace text while preserving run formatting (bold, italic, etc)."""
                                 full_text = para.text
-                                if old_text in full_text:
-                                    new_full_text = full_text.replace(old_text, new_text)
-                                    # Rebuild paragraph with new text
-                                    if para.runs:
-                                        para.runs[0].text = new_full_text
-                                        for run in para.runs[1:]:
-                                            run.text = ""
-                                    changes_counter[0] += 1
-                                    return True
-                                return False
+                                if old_text not in full_text:
+                                    return False
+                                
+                                # First, try to find and replace within a single run (preserves formatting)
+                                for run in para.runs:
+                                    if old_text in run.text:
+                                        # Replace only within this run, preserving its formatting
+                                        run.text = run.text.replace(old_text, new_text)
+                                        changes_counter[0] += 1
+                                        return True
+                                
+                                # If old_text spans multiple runs (rare), reconstruct minimally
+                                old_pos = full_text.find(old_text)
+                                if old_pos == -1:
+                                    return False
+                                
+                                # Build new text, reconstructing via runs
+                                new_text_full = full_text[:old_pos] + new_text + full_text[old_pos + len(old_text):]
+                                
+                                # Last resort: put new text in first run, clear others (fallback)
+                                if para.runs:
+                                    para.runs[0].text = new_text_full
+                                    for run in para.runs[1:]:
+                                        run.text = ""
+                                
+                                changes_counter[0] += 1
+                                return True
                             
                             # Helper to apply replacement across all paragraphs and tables
-                            def apply_replacement_to_doc(doc, old_text, new_text):
+                            # CRITICAL: Context-aware replacement to avoid changing section numbering
+                            def apply_replacement_to_doc(doc, old_text, new_text, target_component=""):
+                                """
+                                Apply replacement with context awareness.
+                                NEVER replace text that appears to be section numbering.
+                                """
+                                import re
                                 found = False
+                                
+                                def is_section_numbering(para_text, old_text):
+                                    """Check if old_text appears as section numbering in the paragraph."""
+                                    # Pattern for section numbering: "6999.1", "51.", "3.2.1", etc.
+                                    # If old_text is a pure number and appears with a dot right after, it's likely section numbering
+                                    if not old_text.strip().isdigit():
+                                        return False
+                                    
+                                    # Check various section numbering patterns
+                                    patterns = [
+                                        rf'\b{re.escape(old_text)}\.(?:\d|[a-zA-Z])',  # "6999.1" or "6999.a"
+                                        rf'^\s*{re.escape(old_text)}\.?\s+\w',  # Line starts with "6999. Something"
+                                        rf'\b{re.escape(old_text)}\.\s+[A-Z]',  # "6999. Title Case"
+                                    ]
+                                    
+                                    for pattern in patterns:
+                                        if re.search(pattern, para_text):
+                                            return True
+                                    return False
+                                
+                                def is_safe_replacement_context(para_text, old_text, target):
+                                    """Check if this is a safe context for replacement (component count, not heading)."""
+                                    text_lower = para_text.lower()
+                                    
+                                    # If we have a target component, only replace in contexts mentioning that component
+                                    if target:
+                                        target_words = target.replace("_", " ").lower().split()
+                                        if not any(word in text_lower for word in target_words if len(word) > 3):
+                                            return False
+                                    
+                                    # Check for component count context indicators
+                                    count_context_words = [
+                                        'chute', 'conveyor', 'line', 'station', 'carrier', 'destination',
+                                        'feedline', 'induct', 'gravity', 'bagging', 'collection', 'rejection',
+                                        'pph', 'throughput', 'capacity', 'total', 'count', 'qty', 'quantity'
+                                    ]
+                                    
+                                    has_component_context = any(word in text_lower for word in count_context_words)
+                                    return has_component_context
+                                
                                 # Check all paragraphs
                                 for para in doc.paragraphs:
+                                    para_text = para.text
+                                    if old_text not in para_text:
+                                        continue
+                                    
+                                    # SAFETY CHECK: Don't replace if it looks like section numbering
+                                    if is_section_numbering(para_text, old_text):
+                                        continue
+                                    
+                                    # SAFETY CHECK: Only replace in component-related contexts
+                                    if not is_safe_replacement_context(para_text, old_text, target_component):
+                                        continue
+                                    
                                     if replace_in_paragraph(para, old_text, new_text):
                                         found = True
                                 
@@ -7705,22 +7916,32 @@ if st.session_state.page == "preview" and "generated_pdf_buffer" in st.session_s
                                     for row in table.rows:
                                         for cell in row.cells:
                                             for para in cell.paragraphs:
+                                                para_text = para.text
+                                                if old_text not in para_text:
+                                                    continue
+                                                
+                                                # SAFETY CHECK: Don't replace if it looks like section numbering
+                                                if is_section_numbering(para_text, old_text):
+                                                    continue
+                                                
+                                                # Tables are usually data - component counts are OK here
                                                 if replace_in_paragraph(para, old_text, new_text):
                                                     found = True
                                 return found
                             
                             # STEP 1: Apply direct value replacements (most reliable)
                             # These come from actionable_info with explicit old/new values
-                            # CRITICAL: Only exact string replacement - NO regex patterns
+                            # CRITICAL: Context-aware replacement - only in component-related paragraphs
                             pending_replacements = st.session_state.get("pending_docx_replacements", [])
                             for replacement in pending_replacements:
                                 old_val = replacement.get("old", "")
                                 new_val = replacement.get("new", "")
+                                target_component = replacement.get("target", "")
                                 
                                 # Only do replacement if we have actual values (not placeholders)
                                 if old_val and new_val and not (old_val.startswith("[") and old_val.endswith("]")):
-                                    # Direct exact string replacement only
-                                    apply_replacement_to_doc(doc, old_val, new_val)
+                                    # Context-aware replacement - pass target component for safety checks
+                                    apply_replacement_to_doc(doc, old_val, new_val, target_component)
                             
                             # Clear pending replacements after applying
                             st.session_state.pending_docx_replacements = []
@@ -8008,12 +8229,21 @@ else:
     with tab1:
         st.markdown("<br>", unsafe_allow_html=True)
         
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
+        # ---- Section: Project Details ----
+        st.markdown("##### Project Details")
+        proj_col1, proj_col2 = st.columns(2)
+        with proj_col1:
             project_name = st.text_input("Project Name *", value="Loop Cross Belt Sorter", placeholder="Enter project name")
+        with proj_col2:
             offer_ref = st.text_input("Offer Reference No *", value="F24-00524", placeholder="e.g., F24-00524")
-            
+        
+        st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
+        
+        # ---- Section: Client Information ----
+        st.markdown("##### Client Information")
+        client_col1, client_col2 = st.columns([2, 1])
+        
+        with client_col1:
             # Client dropdown with add new option
             client_options = list(CLIENT_LOGOS.keys()) + ["+ Add New Client"]
             selected_client = st.selectbox("Client Name *", client_options, index=0)
@@ -8034,23 +8264,8 @@ else:
                 height=80,
                 placeholder="Mr. John Doe\nMs. Jane Smith"
             )
-            # Operational inputs used by System Description generation
-            pph_count = st.text_input("PPH COUNT", value="", placeholder="Parcels per hour (e.g. 2000)")
-            ipp_rate = st.text_input("IPP RATE", value="", placeholder="IPP Rate (e.g. 1200)")
-            
-            col1a, col1b = st.columns(2)
-            with col1a:
-                invitation_date = st.date_input("Invitation Date (optional)", value=None)
-            with col1b:
-                meeting_date = st.date_input("Meeting/Workshop Date (optional)", value=None)
-            
-            # Auto-populate contact details from logged-in user
-            current_user = st.session_state.get('current_user', {})
-            contact_name = current_user.get('name', '')
-            contact_email = current_user.get('email', '')
-            contact_phone = "+91 8750052591"  # Fixed contact number
 
-        with col2:
+        with client_col2:
             st.markdown("**Client Logo Preview**")
             if client_logo_path_display and os.path.exists(client_logo_path_display):
                 st.image(client_logo_path_display, use_container_width=True)
@@ -8058,6 +8273,39 @@ else:
                 st.image(client_logo, use_container_width=True)
             else:
                 st.info("Logo will appear here")
+        
+        st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
+        
+        # ---- Section: Operational Parameters ----
+        st.markdown("##### Operational Parameters")
+        # PPH Slider - ranges from 500 to 80,000, default 10,000
+        pph_count = st.slider(
+            "Throughput (PPH - Parcels Per Hour) *",
+            min_value=500,
+            max_value=80000,
+            value=10000,
+            step=500,
+            format="%d PPH",
+            help="Select the required throughput capacity in parcels per hour"
+        )
+        pph_count = str(pph_count)  # Convert to string for compatibility
+        ipp_rate = ""  # Deprecated - kept for backward compatibility
+        
+        st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
+        
+        # ---- Section: Important Dates ----
+        st.markdown("##### Important Dates")
+        date_col1, date_col2 = st.columns(2)
+        with date_col1:
+            invitation_date = st.date_input("Invitation Date (optional)", value=None)
+        with date_col2:
+            meeting_date = st.date_input("Meeting/Workshop Date (optional)", value=None)
+        
+        # Auto-populate contact details from logged-in user
+        current_user = st.session_state.get('current_user', {})
+        contact_name = current_user.get('name', '')
+        contact_email = current_user.get('email', '')
+        contact_phone = "+91 8750052591"  # Fixed contact number
 
         # Fixed values (not shown to user)
         letter_date = date.today()
@@ -8070,17 +8318,22 @@ else:
     with tab2:
         st.markdown("<br>", unsafe_allow_html=True)
         
-        col1, col2 = st.columns(2)
+        # ---- Section: Required Files ----
+        st.markdown("##### Required Documents")
+        upload_col1, upload_col2 = st.columns(2)
 
-        with col1:
-            dxf_layout_file = st.file_uploader("DXF Layout File *", type=["dxf"], key="dxf_upload")
-            costing_file = st.file_uploader("Costing Sheet *", type=["xlsx", "xls"], key="costing_upload")
+        with upload_col1:
+            dxf_layout_file = st.file_uploader("DXF Layout File *", type=["dxf"], key="dxf_upload", help="System layout in DXF format")
+            costing_file = st.file_uploader("Costing Sheet *", type=["xlsx", "xls"], key="costing_upload", help="Component pricing spreadsheet")
 
-        with col2:
-            capacity_excel = st.file_uploader("Throughput Calculation Sheet *", type=["xlsx", "xls"], key="capacity_upload")
-            prog_gantt = st.file_uploader("Project Timeline Chart (optional)", type=["png", "jpg", "jpeg"], key="gantt_upload")
+        with upload_col2:
+            capacity_excel = st.file_uploader("Throughput Calculation Sheet *", type=["xlsx", "xls"], key="capacity_upload", help="Capacity calculation workbook")
+            prog_gantt = st.file_uploader("Project Timeline Chart (optional)", type=["png", "jpg", "jpeg"], key="gantt_upload", help="Gantt chart or timeline image")
 
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
+        
+        # ---- Section: Optional Layout Image ----
+        st.markdown("##### Solution Layout (Optional)")
         have_solution_png = st.checkbox("I already have a PNG of the solution layout", value=False)
 
         if have_solution_png:
@@ -8113,9 +8366,62 @@ else:
     with tab3:
         st.markdown("<br>", unsafe_allow_html=True)
         
+        # ---- Section: Handled Parcel Spectrum ----
+        with st.expander("Handled Parcel Spectrum", expanded=False):
+            st.markdown("Configure the parcel specifications that will appear in the 'Handled Shipment Spectrum' section of the proposal.")
+            
+            # Initialize default values if not in session state
+            if "parcel_spectrum" not in st.session_state:
+                st.session_state["parcel_spectrum"] = [
+                    {"Specification": "Max Length", "Unit": "mm", "Value": "800"},
+                    {"Specification": "Max Width", "Unit": "mm", "Value": "800"},
+                    {"Specification": "Max Height", "Unit": "mm", "Value": "700"},
+                    {"Specification": "Max Weight", "Unit": "Kg", "Value": "30"},
+                    {"Specification": "Min length", "Unit": "mm", "Value": "100"},
+                    {"Specification": "Min Width", "Unit": "mm", "Value": "100"},
+                    {"Specification": "Min Height", "Unit": "mm", "Value": "50"},
+                    {"Specification": "Min Weight", "Unit": "gm", "Value": "200"},
+                ]
+            
+            # Create dataframe for editing
+            parcel_df = pd.DataFrame(st.session_state["parcel_spectrum"])
+            
+            
+            # Configure column settings
+            column_config = {
+                "Specification": st.column_config.TextColumn(
+                    "Specification",
+                    disabled=True,  # Fixed column
+                    help="Specification name (fixed)"
+                ),
+                "Unit": st.column_config.SelectboxColumn(
+                    "Unit",
+                    options=["mm", "cm", "m", "Kg", "gm", "lbs"],
+                    help="Select unit of measurement"
+                ),
+                "Value": st.column_config.TextColumn(
+                    "Value",
+                    help="Enter the value"
+                )
+            }
+            
+            # Display editable data table
+            edited_parcel_df = st.data_editor(
+                parcel_df,
+                column_config=column_config,
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            
+            # Update session state with edited data
+            st.session_state["parcel_spectrum"] = edited_parcel_df.to_dict(orient="records")
+        
+        # ---- Section: Commercial Settings ----
         with st.expander("Commercial Settings", expanded=False):
             apply_bca = st.checkbox("Apply Business Cooperation Agreement Discount (4.5%)", value=False, key="apply_bca_discount")
             
+            st.markdown("<hr style='margin: 0.5rem 0; border: none; border-top: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
             st.markdown("**Payment Terms**")
             default_payment_terms = [
                 {"Payment Percentage": "20%", "Stage": "Advance along with LOI/ PO"},
@@ -8132,13 +8438,14 @@ else:
             edited_pt_df = st.data_editor(pt_df, num_rows="dynamic", use_container_width=True, key="payment_terms_editor")
             st.session_state["payment_terms"] = edited_pt_df.to_dict(orient="records")
 
+        # ---- Section: Warranty Configuration ----
         with st.expander("Warranty Configuration", expanded=False):
             warranty_type = st.selectbox("Warranty Type", ["Standard warranty", "Comprehensive warranty"], key="warranty_type")
             
-            col1, col2 = st.columns(2)
-            with col1:
+            warranty_col1, warranty_col2 = st.columns(2)
+            with warranty_col1:
                 warranty_duration = st.text_input("Warranty Duration", value="1 year", key="warranty_duration")
-            with col2:
+            with warranty_col2:
                 warranty_start = st.selectbox(
                     "Warranty Start Condition",
                     [
@@ -8151,6 +8458,7 @@ else:
                     key="warranty_start"
                 )
             
+            st.markdown("<hr style='margin: 0.5rem 0; border: none; border-top: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
             warranty_extended = st.checkbox("Include Extended Warranty Option", value=True, key="warranty_extended")
             if warranty_extended:
                 warranty_extended_text = st.text_input(
@@ -8181,8 +8489,9 @@ else:
             else:
                 warranty_transport_text = None
 
+        # ---- Section: Exclusions ----
         with st.expander("Exclusions Configuration", expanded=False):
-            st.write("**Select Exclusions to Include:**")
+            st.markdown("**Select items to exclude from the proposal:**")
             
             variable_exclusions = [
                 "Server PC / server system.",
@@ -8217,7 +8526,8 @@ else:
                 if col.checkbox(item, value=False, key=f"exclusion_{idx}"):
                     selected_exclusions.append(item)
 
-        with st.expander("Key Components", expanded=False):
+        # ---- Section: Key Components ----
+        with st.expander("Key Components & Manufacturers", expanded=False):
             default_components = [
                 {"Items": "Belts", "Make": "Forbo / Derco / Habasit"},
                 {"Items": "Rollers", "Make": "Falcon"},
@@ -8251,9 +8561,11 @@ else:
             )
 
         st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 2px solid #1976D2;'>", unsafe_allow_html=True)
 
-        # Generation button
-        generate_clicked = st.button("Generate Proposal", type="primary", use_container_width=True)
+        # Generation button with prominent styling
+        st.markdown("##### Ready to Generate")
+        generate_clicked = st.button("Generate Proposal", type="primary", use_container_width=True, help="Click to generate your complete proposal document")
 
 # ==================== DOCUMENT GENERATION FUNCTIONS ====================
 
@@ -8717,8 +9029,7 @@ def build_reference_projects_section(doc, counter):
     apply_normal_style(p)
     p.paragraph_format.keep_with_next = True  # Keep with image
     
-    add_centered_image(doc, "FIXED_IMAGE\\proj1.PNG", width_in=4.0)
-
+    add_centered_image(doc, "FIXED_IMAGE\\proj1.PNG", width_in=3.0)
     doc.add_page_break()
 
     # Project 2
@@ -8779,7 +9090,6 @@ def build_reference_projects_section(doc, counter):
     p.paragraph_format.keep_with_next = True  # Keep with image
     
     add_centered_image(doc, "FIXED_IMAGE\\proj2.PNG", width_in=4.0)
-
     doc.add_page_break()
 
     # Project 3
@@ -8835,7 +9145,6 @@ def build_reference_projects_section(doc, counter):
     p.paragraph_format.keep_with_next = True  # Keep with image
     
     add_centered_image(doc, "FIXED_IMAGE\\proj3.PNG", width_in=4.0)
-
     doc.add_page_break()
 
     # Project 4
@@ -8885,7 +9194,6 @@ def build_reference_projects_section(doc, counter):
     p.paragraph_format.keep_with_next = True  # Keep with image
     
     add_centered_image(doc, "FIXED_IMAGE\\proj4.PNG", width_in=4.0)
-
     doc.add_page_break()
 
     # Project 5
@@ -8939,7 +9247,7 @@ def build_reference_projects_section(doc, counter):
     add_centered_image(doc, "FIXED_IMAGE\\proj5.PNG", width_in=4.0)
 
 
-def build_handled_spectrum_section(doc, counter, project_name, client_name):
+def build_handled_spectrum_section(doc, counter, project_name, client_name, user_parcel_spectrum=None):
     """Build Handled Shipment Spectrum section"""
     doc.add_page_break()  # Start on new page
     tpl = choose_sorter_template(project_name)
@@ -8973,8 +9281,17 @@ def build_handled_spectrum_section(doc, counter, project_name, client_name):
     )
     apply_normal_style(p)
 
+    # Determine spec table source: user-provided or template default
+    if user_parcel_spectrum and len(user_parcel_spectrum) > 0:
+        # Use user-provided values
+        spec_data = {item["Specification"]: {"unit": item["Unit"], "value": item["Value"]} 
+                     for item in user_parcel_spectrum}
+    else:
+        # Fall back to template defaults
+        spec_data = tpl.spec_table
+
     # Table
-    table = doc.add_table(rows=1 + len(tpl.spec_table), cols=3)
+    table = doc.add_table(rows=1 + len(spec_data), cols=3)
     apply_table_style(table)
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
 
@@ -8991,7 +9308,7 @@ def build_handled_spectrum_section(doc, counter, project_name, client_name):
 
     # Add data rows only (skip header row creation, we already have it)
     row_idx = 1
-    for spec, data in tpl.spec_table.items():
+    for spec, data in spec_data.items():
         if str(data["value"]).strip() == "":
             continue  # Skip empty rows
         if row_idx >= len(table.rows):
@@ -10678,6 +10995,10 @@ def build_proposed_system_description_section(doc, counter, client_name, project
         if not line:
             continue
         
+        # Skip any lines containing _ParagraphStyle or other style object representations
+        if '_ParagraphStyle' in line or '_Style' in line or 'id:' in line and '<' in line:
+            continue
+        
         # Skip lines that are just "Process Flow" or similar headers
         if line.lower() in ['process flow', 'process']:
             continue
@@ -10850,6 +11171,381 @@ def transform_system_description_numbering(text: str, section_counter: int) -> s
     return transformed
 
 
+def add_chute_volume_calculation_table(doc, chute_type: str):
+    """Add chute volume calculation table based on chute type - matching I/Os table styling"""
+    chute_lower = chute_type.lower()
+    
+    # Define table data for each chute type
+    chute_data = {}
+    
+    # Gravity Chutes
+    if "gravity" in chute_lower and "mini" not in chute_lower:
+        chute_data = {
+            "headers": ["Average parcel size considered for chute volume calculation", "L(m)", "B(m)", "H(m)", "Volume (m3)"],
+            "rows": [
+                ["Gravity Chute", "0.4", "0.2", "0.3", "0.024"],
+            ]
+        }
+    
+    # Mini Gravity Chutes
+    elif "mini" in chute_lower and "gravity" in chute_lower:
+        chute_data = {
+            "headers": ["Average parcel size considered for chute volume calculation", "L(m)", "B(m)", "H(m)", "Volume (m3)"],
+            "rows": [
+                ["Mini Gravity Chute", "0.4", "0.2", "0.3", "0.024"],
+            ]
+        }
+    
+    # Non-Sort Collection Chutes
+    elif "non-sort" in chute_lower or "non sort" in chute_lower:
+        chute_data = {
+            "headers": ["Average shipment size considered for chute volume calculation", "L(m)", "B(m)", "H(m)", "Volume (m3)"],
+            "rows": [
+                ["Collection type PTL Chute", "0.3", "0.3", "0.3", "0.027"],
+                ["PTL Chute", "6.7", "2", "0.5", ""],
+            ]
+        }
+    
+    # Rejection Chutes
+    elif "rejection" in chute_lower:
+        chute_data = {
+            "headers": ["Average shipment size considered for chute volume calculation", "L(m)", "B(m)", "H(m)", "Volume (m3)"],
+            "rows": [
+                ["Collection type chute", "0.4", "0.4", "0.4", "0.064"],
+                ["Rejection Chute", "5.6", "1", "0.3", "1.68"],
+            ]
+        }
+    
+    # Collection Chutes
+    elif "collection" in chute_lower and "non-sort" not in chute_lower:
+        chute_data = {
+            "headers": ["Average shipment size considered for chute volume calculation", "L(m)", "B(m)", "H(m)", "Volume (m3)"],
+            "rows": [
+                ["Collection type chute", "0.4", "0.4", "0.4", "0.064"],
+                ["Collection Chute", "5.6", "1", "0.3", "1.68"],
+            ]
+        }
+    
+    # If no data found, return without adding table
+    if not chute_data:
+        return
+    
+    # Create table - match I/Os table style
+    num_rows = len(chute_data["rows"]) + 1  # +1 for header
+    num_cols = len(chute_data["headers"])
+    table = doc.add_table(rows=num_rows, cols=num_cols)
+    table.style = 'Light Grid Accent 1'
+    
+    # Set column widths to match I/Os tables (1.5" for first, 4.0" for rest, adjusted for more columns)
+    table.autofit = False
+    table.allow_autofit = False
+    table.columns[0].width = Inches(1.5)
+    for i in range(1, num_cols):
+        table.columns[i].width = Inches(0.9)
+    
+    # Add header row - match I/Os table styling
+    header_cells = table.rows[0].cells
+    for col_idx, header_text in enumerate(chute_data["headers"]):
+        header_cells[col_idx].text = header_text
+        for paragraph in header_cells[col_idx].paragraphs:
+            for run in paragraph.runs:
+                run.font.bold = True
+                run.font.name = 'Calibri'
+                run.font.size = Pt(11)  # Match I/Os table header size
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        header_cells[col_idx].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        shade_cell(header_cells[col_idx], "4472C4")  # Blue header
+    
+    # Add data rows - match I/Os table styling
+    for row_idx, row_data in enumerate(chute_data["rows"]):
+        row_cells = table.rows[row_idx + 1].cells
+        for col_idx, cell_value in enumerate(row_data):
+            row_cells[col_idx].text = str(cell_value)
+            for paragraph in row_cells[col_idx].paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = 'Calibri'
+                    run.font.size = Pt(11)  # Match I/Os table data size
+                apply_normal_style(paragraph)  # Use same style application as I/Os tables
+    
+    doc.add_paragraph("")  # Spacing after table
+
+
+def add_chute_ios_table_table1(doc):
+
+    """Add Chute I/Os Table 1 (for Gravity, Mini-Gravity, L-Type, Rejection, Dispersion, Direct Bagging, High Volume, Low Volume, Sliding+Secondary, Non-Sort, Collection chutes)"""
+    table = doc.add_table(rows=5, cols=2)
+    table.style = 'Light Grid Accent 1'
+    
+    # Set column widths
+    table.autofit = False
+    table.allow_autofit = False
+    table.columns[0].width = Inches(1.5)
+    table.columns[1].width = Inches(4.0)
+    
+    # Header row
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Chute I/Os"
+    header_cells[1].text = "Description"
+    
+    for cell in header_cells:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.bold = True
+                run.font.name = 'Calibri'
+                run.font.size = Pt(11)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        shade_cell(cell, "4472C4")  # Blue header
+    
+    # Data rows
+    data = [
+        ("Chute Full Sensor", "To alert the system that the chute is full and mark that chute unavailable for further sortation"),
+        ("Three Colour Tower Lamp", "To indicate the chute status"),
+        ("Push Button", "To Start/Stop Sorting Operations"),
+        ("HMI Display", "To indicate the operator action/shipment status"),
+    ]
+    
+    for i, (ios_name, description) in enumerate(data):
+        row_cells = table.rows[i + 1].cells
+        row_cells[0].text = ios_name
+        row_cells[1].text = description
+        
+        for cell in row_cells:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = 'Calibri'
+                    run.font.size = Pt(11)
+                apply_normal_style(paragraph)
+
+
+def add_chute_ios_table_table2(doc):
+    """Add Chute I/Os Table 2 (for Direct Takeout and Sliding chutes)"""
+    table = doc.add_table(rows=3, cols=2)
+    table.style = 'Light Grid Accent 1'
+    
+    # Set column widths
+    table.autofit = False
+    table.allow_autofit = False
+    table.columns[0].width = Inches(1.5)
+    table.columns[1].width = Inches(4.0)
+    
+    # Header row
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Chute I/Os"
+    header_cells[1].text = "Description"
+    
+    for cell in header_cells:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.bold = True
+                run.font.name = 'Calibri'
+                run.font.size = Pt(11)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        shade_cell(cell, "4472C4")  # Blue header
+    
+    # Data rows
+    data = [
+        ("Chute Full Sensor", "To alert the system that the chute is full and mark that chute unavailable for further sortation"),
+        ("Tower Lamp", "To indicate the chute status"),
+    ]
+    
+    for i, (ios_name, description) in enumerate(data):
+        row_cells = table.rows[i + 1].cells
+        row_cells[0].text = ios_name
+        row_cells[1].text = description
+        
+        for cell in row_cells:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = 'Calibri'
+                    run.font.size = Pt(11)
+                apply_normal_style(paragraph)
+
+
+def try_add_chute_image_and_table(doc, chute_name: str):
+    """Try to add chute image and I/Os table based on chute type"""
+    base_dir = Path(__file__).parent
+    fixed_image_dir = base_dir / "FIXED_IMAGE" / "Chutes"
+    
+    # Map chute types to image files and table type
+    chute_mappings = {
+        # Table 1 chutes
+        "gravity chutes": (fixed_image_dir / "gravity.PNG", 1),
+        "gravity": (fixed_image_dir / "gravity.PNG", 1),
+        "Mini-gravity chutes": (fixed_image_dir / "mini-gravity.PNG", 1),
+        "Mini gravity chutes": (fixed_image_dir / "mini-gravity.PNG", 1),
+        "mini-gravity": (fixed_image_dir / "mini-gravity.PNG", 1),
+        "l-type collection chutes": (fixed_image_dir / "l-type.PNG", 1),
+        "l-type": (fixed_image_dir / "l-type.PNG", 1),
+        "l type collection chutes": (fixed_image_dir / "l-type.PNG", 1),
+        "rejection chutes": (fixed_image_dir / "rejection.PNG", 1),
+        "rejection": (fixed_image_dir / "rejection.PNG", 1),
+        "dispersion chutes": (fixed_image_dir / "dispersion.PNG", 1),
+        "dispersion": (fixed_image_dir / "dispersion.PNG", 1),
+        "direct bagging chutes": (fixed_image_dir / "direct-bagging.PNG", 1),
+        "direct bagging": (fixed_image_dir / "direct-bagging.PNG", 1),
+        "high volume chutes": (fixed_image_dir / "high_volume.PNG", 1),
+        "high volume": (fixed_image_dir / "high_volume.PNG", 1),
+        "low volume chutes": (fixed_image_dir / "low_volume.PNG", 1),
+        "low volume": (fixed_image_dir / "low_volume.PNG", 1),
+        "sliding + secondary chutes": (fixed_image_dir / "sliding_secondary.PNG", 1),
+        "sliding secondary chutes": (fixed_image_dir / "sliding_secondary.PNG", 1),
+        "sliding+secondary": (fixed_image_dir / "sliding_secondary.PNG", 1),
+        "non-sort collection": (fixed_image_dir / "non_sort_collection.PNG", 1),
+        "non sort collection": (fixed_image_dir / "non_sort_collection.PNG", 1),
+        "collection chutes": (fixed_image_dir / "collection.PNG", 1),
+        "collection": (fixed_image_dir / "collection.PNG", 1),
+        
+        # Table 2 chutes
+        "direct takeout chutes": (fixed_image_dir / "direct-takeout.PNG", 2),
+        "direct takeout": (fixed_image_dir / "direct-takeout.PNG", 2),
+        "direct-takeout chutes": (fixed_image_dir / "direct-takeout.PNG", 2),
+        "sliding chutes": (fixed_image_dir / "sliding.PNG", 2),
+        "sliding": (fixed_image_dir / "sliding.PNG", 2),
+    }
+    
+    # Normalize chute name for matching
+    chute_name_lower = (chute_name or "").strip().lower()
+    
+    # Try exact and partial matches
+    for key, (img_path, table_type) in chute_mappings.items():
+        if chute_name_lower == key or key in chute_name_lower:
+            # Add image if it exists
+            if img_path.exists():
+                try:
+                    p = doc.add_paragraph()
+                    run = p.add_run()
+                    run.add_picture(str(img_path), width=Inches(4.0))
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    doc.add_paragraph("")
+                except Exception as e:
+                    print(f"Warning: Could not add chute image {img_path.name}: {e}")
+            
+            # Add appropriate table
+            if table_type == 1:
+                add_chute_ios_table_table1(doc)
+            elif table_type == 2:
+                add_chute_ios_table_table2(doc)
+            
+            doc.add_paragraph("")
+            return True
+    
+    return False
+
+
+def auto_insert_chute_markers(text: str) -> str:
+    """
+    Automatically insert [[CHUTE_COMPONENTS: ...]] markers after chute type headings.
+    
+    Detects chute type headings and inserts the marker after the description paragraph.
+    """
+    import re
+    
+    # Define chute types that should get components and tables
+    chute_patterns = {
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Gravity\s+Chutes?)\s*\*\*': 'Gravity Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Mini[-\s]?Gravity\s+Chutes?)\s*\*\*': 'Mini-Gravity Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(L[-\s]?Type\s+(?:Collection\s+)?Chutes?)\s*\*\*': 'L-Type Collection Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Rejection\s+Chutes?)\s*\*\*': 'Rejection Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Dispersion\s+Chutes?)\s*\*\*': 'Dispersion Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Direct\s+Bagging\s+Chutes?)\s*\*\*': 'Direct Bagging Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(High\s+Volume\s+Chutes?)\s*\*\*': 'High Volume Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Low\s+Volume\s+Chutes?)\s*\*\*': 'Low Volume Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Sliding\s*[+&]\s*Secondary\s+Chutes?)\s*\*\*': 'Sliding + Secondary Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Non[-\s]?Sort\s+Collection)\s*\*\*': 'Non-Sort Collection',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Collection\s+Chutes?)\s*\*\*': 'Collection Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Direct\s+Take[-\s]?out\s+Chutes?)\s*\*\*': 'Direct Takeout Chutes',
+        r'\*\*\s*(\d+(?:\.\d+)*\.?)\s*(Sliding\s+Chutes?)\s*\*\*': 'Sliding Chutes',
+    }
+    
+    lines = text.splitlines()
+    result_lines = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        result_lines.append(line)
+        
+        # Check if this line matches any chute pattern
+        matched_chute = None
+        for pattern, chute_name in chute_patterns.items():
+            if re.search(pattern, line, re.IGNORECASE):
+                matched_chute = chute_name
+                break
+        
+        if matched_chute:
+            # Found a chute heading - skip ahead to find the end of the description
+            # Then insert the marker
+            i += 1
+            description_lines = []
+            
+            # Collect description paragraphs (non-empty, non-heading lines)
+            while i < len(lines):
+                next_line = lines[i].strip()
+                
+                # Stop if we hit an empty line followed by another heading
+                if not next_line:
+                    # Peek ahead to see if next non-empty line is a heading
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip():
+                        j += 1
+                    if j < len(lines) and re.match(r'\*\*\s*\d+(?:\.\d+)*\.?\s*.+\*\*', lines[j]):
+                        # Next heading found, insert marker before these empty lines
+                        result_lines.extend(description_lines)
+                        result_lines.append("")  # Empty line
+                        result_lines.append(f"[[CHUTE_COMPONENTS: {matched_chute}]]")
+                        result_lines.append("")  # Empty line after marker
+                        break
+                    else:
+                        # Just an empty line in the description
+                        description_lines.append(lines[i])
+                        i += 1
+                        continue
+                
+                # Stop if we hit another heading
+                if re.match(r'\*\*\s*\d+(?:\.\d+)*\.?\s*.+\*\*', next_line):
+                    # Insert marker before this heading
+                    result_lines.extend(description_lines)
+                    result_lines.append("")
+                    result_lines.append(f"[[CHUTE_COMPONENTS: {matched_chute}]]")
+                    result_lines.append("")
+                    break
+                
+                # Stop if we hit an image placeholder
+                if "image placeholder" in next_line.lower() or next_line.startswith("[["):
+                    result_lines.extend(description_lines)
+                    result_lines.append("")
+                    result_lines.append(f"[[CHUTE_COMPONENTS: {matched_chute}]]")
+                    result_lines.append("")
+                    break
+                
+                # Add description line
+                description_lines.append(lines[i])
+                i += 1
+                
+                # Limit to ~5 lines of description
+                if len(description_lines) >= 5:
+                    result_lines.extend(description_lines)
+                    result_lines.append("")
+                    result_lines.append(f"[[CHUTE_COMPONENTS: {matched_chute}]]")
+                    result_lines.append("")
+                    break
+            
+            # If we've reached end of file, still add the marker
+            if i >= len(lines) and description_lines:
+                result_lines.extend(description_lines)
+                result_lines.append("")
+                result_lines.append(f"[[CHUTE_COMPONENTS: {matched_chute}]]")
+                result_lines.append("")
+        
+        i += 1
+    
+    return "\n".join(result_lines)
+
+
+
+
 def build_system_description_section(doc, counter, system_description_text, costing_file=None):
     """
     Build System Description as a separate top-level section.
@@ -10869,6 +11565,9 @@ def build_system_description_section(doc, counter, system_description_text, cost
     
     # Transform the internal numbering to match section counter
     transformed_text = transform_system_description_numbering(system_description_text, counter)
+    
+    # Auto-insert chute component markers after chute type headings
+    transformed_text = auto_insert_chute_markers(transformed_text)
     
     lines = transformed_text.splitlines()
     table_inserted = False
@@ -10988,6 +11687,9 @@ def build_system_description_section(doc, counter, system_description_text, cost
     heading_rx = _re_fmt.compile(r"^\s*\*\*\s*(\d+(?:\.\d+)*\.?)\s*(.+?)\s*\*\*\s*$")
     bullet_rx = _re_fmt.compile(r"^\s*[-*•]\s+(.+)$")
     
+    # Track pending chute type for image/table insertion
+    pending_chute_type = None
+    
     def _add_formatted_paragraph(doc, text_line: str):
         """Add a paragraph with proper bold/bullet formatting."""
         stripped = text_line.strip()
@@ -11002,7 +11704,7 @@ def build_system_description_section(doc, counter, system_description_text, cost
             run.bold = True
             run.font.size = Pt(12)
             run.font.name = 'Calibri'
-            return
+            return heading_text  # Return heading text for chute detection
         
         # Handle bullet points
         bullet_match = bullet_rx.match(stripped)
@@ -11020,7 +11722,7 @@ def build_system_description_section(doc, counter, system_description_text, cost
             else:
                 p.add_run(bullet_text)
             apply_normal_style(p)
-            return
+            return None
         
         # Handle regular text with possible **bold** markers
         if "**" in stripped:
@@ -11036,6 +11738,8 @@ def build_system_description_section(doc, counter, system_description_text, cost
         else:
             p = doc.add_paragraph(text_line)
             apply_normal_style(p)
+        
+        return None
     
     for i, line in enumerate(lines):
         line_stripped = line.strip()
@@ -11111,8 +11815,123 @@ def build_system_description_section(doc, counter, system_description_text, cost
                 pass
             continue
         
+        # Check for special marker to insert chute components list + table
+        # Format: [[CHUTE_COMPONENTS: Chute Type Name]]
+        if line_stripped.startswith("[[CHUTE_COMPONENTS:") and line_stripped.endswith("]]"):
+            import re as _marker_re
+            marker_match = _marker_re.match(r"\[\[CHUTE_COMPONENTS:\s*(.+?)\s*\]\]", line_stripped)
+            if marker_match:
+                chute_type_name = marker_match.group(1).strip()
+                
+                # Step 1: Add chute image first
+                base_dir = Path(__file__).parent
+                fixed_image_dir = base_dir / "FIXED_IMAGE" / "Chutes"
+                chute_mappings = {
+                    # Table 1 chutes
+                    "gravity chutes": (fixed_image_dir / "gravity.PNG", 1),
+                    "gravity": (fixed_image_dir / "gravity.PNG", 1),
+                    "mini-gravity chutes": (fixed_image_dir / "mini-gravity.PNG", 1),
+                    "mini gravity chutes": (fixed_image_dir / "mini-gravity.PNG", 1),
+                    "mini-gravity": (fixed_image_dir / "mini-gravity.PNG", 1),
+                    "l-type collection chutes": (fixed_image_dir / "l-type.PNG", 1),
+                    "l-type": (fixed_image_dir / "l-type.PNG", 1),
+                    "l type collection chutes": (fixed_image_dir / "l-type.PNG", 1),
+                    "rejection chutes": (fixed_image_dir / "rejection.PNG", 1),
+                    "rejection": (fixed_image_dir / "rejection.PNG", 1),
+                    "dispersion chutes": (fixed_image_dir / "dispersion.PNG", 1),
+                    "dispersion": (fixed_image_dir / "dispersion.PNG", 1),
+                    "direct bagging chutes": (fixed_image_dir / "direct-bagging.PNG", 1),
+                    "direct bagging": (fixed_image_dir / "direct-bagging.PNG", 1),
+                    "high volume chutes": (fixed_image_dir / "high_volume.PNG", 1),
+                    "high volume": (fixed_image_dir / "high_volume.PNG", 1),
+                    "low volume chutes": (fixed_image_dir / "low_volume.PNG", 1),
+                    "low volume": (fixed_image_dir / "low_volume.PNG", 1),
+                    "sliding + secondary chutes": (fixed_image_dir / "sliding_secondary.PNG", 1),
+                    "sliding secondary chutes": (fixed_image_dir / "sliding_secondary.PNG", 1),
+                    "sliding+secondary": (fixed_image_dir / "sliding_secondary.PNG", 1),
+                    "non-sort collection": (fixed_image_dir / "non_sort_collection.PNG", 1),
+                    "non sort collection": (fixed_image_dir / "non_sort_collection.PNG", 1),
+                    "collection chutes": (fixed_image_dir / "collection.PNG", 1),
+                    "collection": (fixed_image_dir / "collection.PNG", 1),
+                    # Table 2 chutes
+                    "direct takeout chutes": (fixed_image_dir / "direct-takeout.PNG", 2),
+                    "direct takeout": (fixed_image_dir / "direct-takeout.PNG", 2),
+                    "direct-takeout chutes": (fixed_image_dir / "direct-takeout.PNG", 2),
+                    "sliding chutes": (fixed_image_dir / "sliding.PNG", 2),
+                    "sliding": (fixed_image_dir / "sliding.PNG", 2),
+                }
+                
+                chute_name_lower = chute_type_name.strip().lower()
+                img_path = None
+                table_type = 1  # Default to table 1
+                
+                # Find matching chute type
+                for key, (path, ttype) in chute_mappings.items():
+                    if chute_name_lower == key or key in chute_name_lower:
+                        img_path = path
+                        table_type = ttype
+                        break
+                
+                # Add image if found
+                if img_path and img_path.exists():
+                    try:
+                        p = doc.add_paragraph()
+                        run = p.add_run()
+                        run.add_picture(str(img_path), width=Inches(4.0))
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        doc.add_paragraph("")
+                    except Exception as e:
+                        st.warning(f"Could not add chute image {img_path.name}: {e}")
+                
+                # Step 1.5: Add volume calculation table for specific chute types
+                volume_chute_types = ["gravity chutes", "gravity", "mini-gravity chutes", "mini gravity chutes", 
+                                     "mini-gravity", "non-sort collection", "non sort collection", 
+                                     "rejection chutes", "rejection", "collection chutes", "collection"]
+                if any(chute_name_lower == vtype or vtype in chute_name_lower for vtype in volume_chute_types):
+                    try:
+                        add_chute_volume_calculation_table(doc, chute_type_name)
+                    except Exception as e:
+                        st.warning(f"Could not add volume table for {chute_type_name}: {e}")
+                
+                # Step 2: Add "Each Chute is equipped..." intro
+                p = doc.add_paragraph("Each Chute is equipped with below components to ease the operations:")
+                apply_normal_style(p)
+                
+                # Step 3: Add component bullet list
+                # Determine which components list based on chute type
+                chute_type_lower = chute_type_name.lower()
+                if "direct takeout" in chute_type_lower or ("sliding" in chute_type_lower and "secondary" not in chute_type_lower):
+                    # Table 2 components (simpler)
+                    components = [
+                        "Chute Full Sensor",
+                        "Tower Light",
+                    ]
+                else:
+                    # Table 1 components (full set)
+                    components = [
+                        "Chute Full Sensor",
+                        "Tower Light",
+                        "Push Button",
+                    ]
+                
+                for comp in components:
+                    p = doc.add_paragraph(comp, style='List Bullet')
+                    apply_normal_style(p)
+                
+                doc.add_paragraph("")  # Spacing
+                
+                # Step 4: Add appropriate table
+                if table_type == 1:
+                    add_chute_ios_table_table1(doc)
+                elif table_type == 2:
+                    add_chute_ios_table_table2(doc)
+                
+                doc.add_paragraph("")
+                
+            continue
+        
         # Regular text line - insert as formatted paragraph
-        _add_formatted_paragraph(doc, line)
+        heading_text_detected = _add_formatted_paragraph(doc, line)
 
     # Fallback: if marker was missing but we have a costing file, try heading-based insertion
     if not table_inserted and costing_file:
@@ -11154,7 +11973,7 @@ def extract_conveyor_boq_from_excel(costing_file) -> List[List[str]]:
             return []
         
         # Re-read with correct header
-        df = pd.read_excel(costing_file, sheet_name="Conveyors", header=header_row_idx)
+        df = pd.read_excel(costing_file, sheet_name="Conveyors" or "Conveyors " or "conveyors", header=header_row_idx)
         
         # Expected columns (in order)
         required_cols = ['S No.', 'Name', 'EL_1', 'EL_2', 'Conveyor Length (m)', 'Conveyor width (mm)', 'Set']
@@ -11660,11 +12479,25 @@ if st.session_state.get("page", "input") == "input" and 'generate_clicked' in di
                 # Build unified ProposalContext (facts-first, then costing, then DXF heuristics)
                 # Always build context to ensure it's available for audit (not conditional on flag)
                 try:
+                    # Ensure costing_metrics includes the PPH from slider
+                    costing_metrics_with_pph = {}
+                    if facts and facts.costing_metrics:
+                        costing_metrics_with_pph = facts.costing_metrics.copy()
+                    
+                    # Add PPH from slider if available
+                    if pph_count and str(pph_count).strip():
+                        try:
+                            pph_val = int(str(pph_count).strip())
+                            costing_metrics_with_pph["throughput_pph"] = pph_val
+                            logger.info(f"Added PPH from slider to costing_metrics: {pph_val}")
+                        except ValueError:
+                            logger.warning(f"Could not parse pph_count as integer: {pph_count}")
+                    
                     context = build_proposal_context(
-                    facts=facts,
-                    costing_metrics=(facts.costing_metrics if facts and facts.costing_metrics else {}),
-                    dxf_json=dxf_json
-                )
+                        facts=facts,
+                        costing_metrics=costing_metrics_with_pph,
+                        dxf_json=dxf_json
+                    )
                     st.session_state.proposal_context = context
                     logger.info("ProposalContext created and stored in session_state")
                     # Log normalized counts and validate pre-generation
@@ -11769,6 +12602,8 @@ if st.session_state.get("page", "input") == "input" and 'generate_clicked' in di
                         st.session_state.section_original_cover_letter = cover_letter_text  # Store original for comparison
                     except Exception as e:
                         cover_letter_text = None
+                        logger.error(f"Cover letter generation failed: {e}", exc_info=True)
+                        st.warning(f"Cover letter generation failed: {str(e)[:100]}")
                 
                 # Continue processing DXF if needed
                 if (include_proposed_system or include_concept_desc) and dxf_layout_file and process_flow_text:
@@ -12033,7 +12868,8 @@ if st.session_state.get("page", "input") == "input" and 'generate_clicked' in di
                 
                 # 4. Handled Shipment Spectrum
                 if include_handled_spectrum:
-                    build_handled_spectrum_section(doc, counter, project_name, client_name)
+                    user_parcel_spectrum = st.session_state.get("parcel_spectrum", None)
+                    build_handled_spectrum_section(doc, counter, project_name, client_name, user_parcel_spectrum)
                     counter += 1
 
                 # 5. Proposed System Description
@@ -12096,24 +12932,32 @@ if st.session_state.get("page", "input") == "input" and 'generate_clicked' in di
                     try:
                         mechanical_bom_items = generate_mechanical_bom_from_costing(costing_file)
                     except Exception as e:
-                        pass  # Silent fail for Mechanical BOM
+                        logger.error(f"Mechanical BOM generation failed: {e}")
+                        mechanical_bom_items = None
                     
                     # Generate Electrical Equipment and Control System using Groq API
                     try:
                         # Load Quote Master sheet from costing file
                         with pd.ExcelFile(io.BytesIO(costing_file.getvalue())) as xls:
                             quote_master_sheet = None
+                            logger.info(f"Costing file sheets: {xls.sheet_names}")
                             for sheet in xls.sheet_names:
                                 if sheet.lower().strip() == "quote master":
                                     quote_master_sheet = sheet
                                     break
                             
                             if quote_master_sheet:
+                                logger.info(f"Found Quote Master sheet: {quote_master_sheet}")
                                 df_quote = pd.read_excel(xls, sheet_name=quote_master_sheet)
                                 sheet_text = df_to_compact_text_quote_master(df_quote)
                                 bom_json = call_groq_for_bom(sheet_text)
+                                if bom_json and "sections" in bom_json:
+                                    logger.info(f"BOM JSON sections: {[s.get('title') for s in bom_json.get('sections', [])]}")
+                            else:
+                                logger.warning(f"Quote Master sheet not found. Available sheets: {xls.sheet_names}")
                     except Exception as e:
-                        pass  # Silent fail for Quote Master extraction
+                        logger.error(f"BOM extraction failed: {e}", exc_info=True)
+                        bom_json = None
                 
                 # Build section if we have either mechanical BOM or electrical/control from Groq
                 has_mechanical = mechanical_bom_items is not None and len(mechanical_bom_items) > 0

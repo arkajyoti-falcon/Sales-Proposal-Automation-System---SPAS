@@ -98,7 +98,7 @@ ROLE_KEYWORDS = {
 }
 
 SHEETNAME_HINTS = {
-    "conveyors": [r"\bconveyors?\b"],
+    "conveyors": [r"(?i)\bconveyors?\b", r"(?i)\bconveyor\s+\b"],  # Case-insensitive: conveyor, conveyors, Conveyor, "Conveyor "
     "destinations": [r"\bdestinations?\b"],
     "ptl": [r"\bptl\b"],
     "steelworks": [r"\bsteelworks?\b", r"\bsteel works\b"],

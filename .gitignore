@@ -7,6 +7,9 @@
 # The old .gitignore folder (created by mistake)
 .gitignore_old_folder/
 
+# Output folder with generated files (DXF uploads, proposals, etc.)
+OUTPUT/
+
 # Python
 __pycache__/
 *.py[cod]

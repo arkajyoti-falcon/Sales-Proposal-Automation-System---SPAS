@@ -1,0 +1,152 @@
+{
+  "weighing conveyor": {
+    "stage": "INDUCT",
+    "priority": 30,
+    "aliases": ["weighing conveyors", "weight conveyor", "weigh conveyor", "weighing_conveyor"]
+  },
+  "buffer conveyor": {
+    "stage": "INDUCT",
+    "priority": 20,
+    "aliases": ["buffer conveyors", "buffer_conveyor", "buffer_conveyors"]
+  },
+  "orientation / loading conveyor": {
+    "stage": "INDUCT",
+    "priority": 10,
+    "aliases": ["orientation conveyor", "orientation loading conveyor", "orientation_loading_conveyor", "orienting conveyor", "loading conveyor"]
+  },
+  "intelligent merge conveyor": {
+    "stage": "INDUCT",
+    "priority": 40,
+    "aliases": ["merge conveyor", "intelligent_merge_conveyor", "merge_conveyor", "smart merge"]
+  },
+  "infeed conveyor": {
+    "stage": "INFEED",
+    "priority": 50,
+    "aliases": ["infeed conveyors", "infeed_conveyor", "infeed_conveyors", "receiving conveyor", "receiving conveyors"]
+  },
+  "straight and inclined conveyor": {
+    "stage": "INFEED",
+    "priority": 40,
+    "aliases": ["straight conveyor", "inclined conveyor", "straight_and_inclined_conveyor", "pvc belt conveyor"]
+  },
+  "curve conveyor": {
+    "stage": "INFEED",
+    "priority": 45,
+    "aliases": ["curve conveyors", "curve_conveyor", "curved conveyor", "turning conveyor"]
+  },
+  "telescopic belt conveyor": {
+    "stage": "INFEED",
+    "priority": 30,
+    "aliases": ["telescopic conveyor", "telescopic_belt_conveyor", "tbc", "telescope conveyor"]
+  },
+  "vds loop conveyor": {
+    "stage": "INFEED",
+    "priority": 20,
+    "aliases": ["volume distribution", "vds conveyor", "vds_loop", "volume distribution system"]
+  },
+  "plastic modular conveyor": {
+    "stage": "INFEED",
+    "priority": 35,
+    "aliases": ["plastic conveyor", "modular conveyor", "plastic_modular_conveyor"]
+  },
+  "aligning conveyor": {
+    "stage": "INFEED",
+    "priority": 42,
+    "aliases": ["alligning conveyor", "aligning_conveyor", "align conveyor", "alignment conveyor"]
+  },
+  "belt merge": {
+    "stage": "INFEED",
+    "priority": 48,
+    "aliases": ["belt_merge", "merge conveyor", "belt merger"]
+  },
+  "manual induct station": {
+    "stage": "INDUCT",
+    "priority": 5,
+    "aliases": ["manual induct", "operator station", "manual_induct_station", "induct station"]
+  },
+  "automatic induct lines": {
+    "stage": "INDUCT",
+    "priority": 1,
+    "aliases": ["induct lines", "induction lines", "feedline", "feedlines", "feed lines", "automatic_induct_lines", "auto induct"]
+  },
+  "main loop": {
+    "stage": "MAIN_LOOP",
+    "priority": 10,
+    "aliases": ["loop cbs", "cross belt sorter", "cbs", "main_loop", "sorter"]
+  },
+  "linear cbs": {
+    "stage": "MAIN_LOOP",
+    "priority": 15,
+    "aliases": ["linear sorter", "linear_cbs", "linear cbs sorter"]
+  },
+  "carrier wheel drive": {
+    "stage": "MAIN_LOOP",
+    "priority": 30,
+    "aliases": ["carrier wheel", "carrier_wheel_drive", "wheel drive"]
+  },
+  "friction wheel drive": {
+    "stage": "MAIN_LOOP",
+    "priority": 32,
+    "aliases": ["friction wheel", "friction_wheel_drive"]
+  },
+  "linear motor drive": {
+    "stage": "MAIN_LOOP",
+    "priority": 34,
+    "aliases": ["linear motor", "linear_motor_drive", "motor drive"]
+  },
+  "servo roller": {
+    "stage": "MAIN_LOOP",
+    "priority": 36,
+    "aliases": ["servo_roller", "servo system"]
+  },
+  "gravity chute": {
+    "stage": "OUTPUT",
+    "priority": 20,
+    "aliases": ["gravity chutes", "gravity_chute", "gravity_chutes"]
+  },
+  "mini gravity chute": {
+    "stage": "OUTPUT",
+    "priority": 22,
+    "aliases": ["mini gravity chutes", "mini_gravity_chute", "mini_gravity_chutes", "mini chute"]
+  },
+  "collection chute": {
+    "stage": "OUTPUT",
+    "priority": 24,
+    "aliases": ["collection chutes", "collection_chute", "collection_chutes", "collecting chute"]
+  },
+  "rejection chute": {
+    "stage": "OUTPUT",
+    "priority": 26,
+    "aliases": ["rejection chutes", "rejection_chute", "rejection_chutes", "reject chute"]
+  },
+  "dispersion chute": {
+    "stage": "OUTPUT",
+    "priority": 28,
+    "aliases": ["dispersion chutes", "dispersion_chute", "dispersion_chutes"]
+  },
+  "bulk chute": {
+    "stage": "OUTPUT",
+    "priority": 30,
+    "aliases": ["bulk chutes", "bulk_chute", "bulk_chutes"]
+  },
+  "direct bagging chute": {
+    "stage": "BAGGING",
+    "priority": 10,
+    "aliases": ["direct bagging chutes", "direct_bagging_chute", "direct_bagging_chutes", "bagging chute"]
+  },
+  "loop steelworks": {
+    "stage": "MAIN_LOOP",
+    "priority": 50,
+    "aliases": ["steelworks", "steel work", "steelwork", "loop_steelworks", "structure"]
+  },
+  "barcode scanner": {
+    "stage": "MAIN_LOOP",
+    "priority": 5,
+    "aliases": ["barcode scan", "barcode_scanner", "scanner", "vision system"]
+  },
+  "divert gates": {
+    "stage": "OUTPUT",
+    "priority": 5,
+    "aliases": ["divert gate", "divert_gate", "gate", "diverter"]
+  }
+}
